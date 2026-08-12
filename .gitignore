@@ -30,6 +30,12 @@ htmlcov/
 # Maven
 **/target/
 
+# Recovery MCP local runtime artifacts and secret material
+# OAuth signing keys + token cache, and the server-side tenancy registry
+**/.oauth_state/
+**/tenancies.local.toml
+**/tenancies.toml
+
 # GoldenGate MCP local runtime artifacts
 **/logs/
 **/oracle-goldengate-mcp-server.env
