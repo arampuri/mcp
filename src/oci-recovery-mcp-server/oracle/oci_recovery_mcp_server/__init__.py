@@ -5,4 +5,4 @@ https://oss.oracle.com/licenses/upl.
 """
 
 __project__ = "oracle.oci-recovery-mcp-server"
-__version__ = "2.1.1"
+__version__ = "3.0.0"
