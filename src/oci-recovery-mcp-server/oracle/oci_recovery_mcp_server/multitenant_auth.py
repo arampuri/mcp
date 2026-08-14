@@ -29,19 +29,24 @@ https://oss.oracle.com/licenses/upl.
 #     stamped with the `oracle_mcp_tenant_alias` claim so tool routing is bound to
 #     the proven identity, not a mutable request header.
 #
-# Per-tenancy isolation (matching the old one-process-per-tenancy deployment):
-#   * a dedicated DiskStore for OAuth state under <storage_root>/<alias>/oauth
-#   * a dedicated JWT signing key (from the registry, else generated + persisted
-#     atomically with 0600 perms under <storage_root>/<alias>/signing.key)
+# Authentication itself is not implemented here. Each tenancy's provider and
+# request-scoped OCI credentials come from oracle-mcp-common's
+# build_idcs_http_auth() / IDCSHttpAuth.context_for(); this module only decides
+# which tenancy a request belongs to and composes the per-tenancy routes.
+#
+# Per-tenancy isolation (matching the old one-process-per-tenancy deployment) is
+# preserved by the shared builder rather than configured here: FastMCP derives both
+# the token signing key and the encrypted OAuth-state directory from the upstream
+# client secret, which differs per tenancy, so no tenancy can read another's state
+# and keys stay stable across restarts and workers.
 
 from __future__ import annotations
 
-import os
-import secrets
 from typing import Optional
 from urllib.parse import urlparse
 
 from mcp.server.auth.routes import build_resource_metadata_url, cors_middleware
+from oracle_mcp_common import IDCSHttpAuth, IDCSHttpAuthOptions, build_idcs_http_auth
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
@@ -50,52 +55,11 @@ from starlette.routing import Mount, Route
 from fastmcp.server.auth.auth import AccessToken, AuthProvider
 from fastmcp.utilities.logging import get_logger
 
-from .tenancy_registry import TenancyRegistry
+from .tenancy_registry import RegistryError, TenancyEntry, TenancyRegistry
 
 logger = get_logger(__name__)
 
 TENANT_CLAIM = "oracle_mcp_tenant_alias"
-
-
-def _domain_to_url(domain: str) -> str:
-    """Normalize an IAM domain host or URL into an https base URL (no trailing slash).
-
-    HTTPS-only: the IAM domain carries the OAuth/token-exchange flows, so an explicit
-    http:// scheme is rejected rather than silently used.
-    """
-    d = (domain or "").strip()
-    if d.startswith("http://"):
-        raise ValueError(
-            f"idcs_domain must use https, not http: {d!r}. Use the bare host "
-            "(idcs-xxxx.identity.oraclecloud.com) or an https:// URL."
-        )
-    if d.startswith("https://"):
-        return d.rstrip("/")
-    return f"https://{d}"
-
-
-def load_or_create_signing_key(storage_root: str, alias: str) -> bytes:
-    """Return a stable 32-byte signing key for a tenancy, persisted on disk.
-
-    The key is created exactly once (O_CREAT|O_EXCL, mode 0600) and never
-    overwritten, so restarts don't invalidate already-issued tokens and a race
-    between workers can't clobber an existing key.
-    """
-    key_dir = os.path.join(storage_root, alias)
-    os.makedirs(key_dir, exist_ok=True)
-    key_path = os.path.join(key_dir, "signing.key")
-    if not os.path.exists(key_path):
-        try:
-            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                os.fchmod(fd, 0o600)  # guarantee perms regardless of umask
-                os.write(fd, secrets.token_bytes(32))
-            finally:
-                os.close(fd)
-        except FileExistsError:
-            pass  # another worker created it first; read theirs below
-    with open(key_path, "rb") as f:
-        return f.read()
 
 
 class MultiTenantOCIAuth(AuthProvider):
@@ -106,21 +70,15 @@ class MultiTenantOCIAuth(AuthProvider):
         registry: TenancyRegistry,
         *,
         base_url: str,
-        storage_root: str,
         required_scopes: Optional[list[str]] = None,
-        require_authorization_consent: bool = False,
-        redirect_path: str = "/auth/callback",
     ):
         super().__init__(base_url=base_url, required_scopes=required_scopes or ["openid"])
         self._registry = registry
         self._root = str(self.base_url).rstrip("/")
-        self._storage_root = storage_root
-        self._require_consent = require_authorization_consent
-        self._redirect_path = redirect_path
         self._real_resource: Optional[AnyHttpUrl] = None
 
-        os.makedirs(storage_root, exist_ok=True)
-        self._providers = {e.alias: self._build_provider(e) for e in registry.entries}
+        self._http_auth = {e.alias: self._build_http_auth(e) for e in registry.entries}
+        self._providers = {alias: h.provider for alias, h in self._http_auth.items()}
         logger.info(
             "Multi-tenant OCI OAuth initialized for %d tenancies: %s",
             len(self._providers),
@@ -129,28 +87,48 @@ class MultiTenantOCIAuth(AuthProvider):
 
     # -- construction ---------------------------------------------------------
 
-    def _build_provider(self, entry):
-        from fastmcp.server.auth.providers.oci import OCIProvider
-        from key_value.aio.stores.disk import DiskStore
+    def _build_http_auth(self, entry: TenancyEntry) -> IDCSHttpAuth:
+        """Build one tenancy's shared IDCS HTTP auth via oracle-mcp-common.
 
+        Every authentication input is passed explicitly per tenancy, so the shared
+        builder never falls back to a process-wide IDCS_* environment variable and
+        one tenancy's domain, client, or audience can never be applied to another.
+        `base_url` is this tenancy's own mount, which is what makes the resulting
+        provider advertise (and accept) /t/<alias>/authorize and
+        /t/<alias>/auth/callback.
+
+        Nothing about the provider is configured locally: the token signing key and
+        the encrypted OAuth-state directory are derived by FastMCP from this
+        tenancy's client secret, and consent and the /auth/callback redirect path
+        take the shared library's defaults.
+        """
         alias = entry.alias
-        storage_dir = os.path.join(self._storage_root, alias, "oauth")
-        os.makedirs(storage_dir, exist_ok=True)
-        signing_key = entry.jwt_signing_key or load_or_create_signing_key(
-            self._storage_root, alias
-        )
-        domain_url = _domain_to_url(entry.idcs_domain)
-        return OCIProvider(
-            config_url=f"{domain_url}/.well-known/openid-configuration",
-            client_id=entry.client_id,
-            client_secret=entry.client_secret,
-            base_url=f"{self._root}/t/{alias}",
-            redirect_path=self._redirect_path,
-            required_scopes=list(self.required_scopes),
-            require_authorization_consent=self._require_consent,
-            jwt_signing_key=signing_key,
-            client_storage=DiskStore(directory=storage_dir),
-        )
+        try:
+            return build_idcs_http_auth(
+                list(self.required_scopes),
+                IDCSHttpAuthOptions(
+                    domain=entry.idcs_domain,
+                    client_id=entry.client_id,
+                    client_secret=entry.client_secret,
+                    audience=entry.audience,
+                    base_url=f"{self._root}/t/{alias}",
+                    region=entry.region,
+                ),
+            )
+        except ValueError as e:
+            # Name the tenancy: with many entries the shared message alone doesn't
+            # say which registry table is at fault.
+            raise RegistryError(f"Registry entry [{alias}] cannot be used for OAuth: {e}") from e
+
+    def http_auth_for(self, alias: Optional[str]) -> Optional[IDCSHttpAuth]:
+        """Return a tenancy's shared IDCS HTTP auth policy (None if unknown).
+
+        Callers exchange the current request's access token through
+        IDCSHttpAuth.context_for(); the returned signer is request-scoped and must
+        never be cached. Only the policy itself -- provider plus this tenancy's own
+        server-side credentials -- is long-lived, exactly like the provider it wraps.
+        """
+        return self._http_auth.get(alias) if alias else None
 
     # -- token verification (token-authoritative tenant binding) --------------
 
@@ -205,6 +183,13 @@ class MultiTenantOCIAuth(AuthProvider):
         routes: list = []
 
         for alias, provider in self._providers.items():
+            # Every tenancy protects the same single resource, the /mcp endpoint --
+            # not /t/<alias>/mcp, which is only where that tenancy's OAuth routes are
+            # mounted. Declaring it before get_routes() lets the provider derive its
+            # own resource URL (and the audience of the tokens it issues) from it,
+            # so the resource indicator a client sends is the one it validates.
+            provider.resource_base_url = self.base_url
+
             all_routes = provider.get_routes(mcp_path=mcp_path)
 
             # Path-aware authorization-server metadata stays at the root level.
@@ -223,11 +208,6 @@ class MultiTenantOCIAuth(AuthProvider):
                 if isinstance(r, Route) and not r.path.startswith("/.well-known/")
             ]
             routes.append(Mount(f"/t/{alias}", routes=op))
-
-            # The real protected resource is the single /mcp endpoint, not
-            # /t/<alias>/mcp; fix it so OCIProvider.authorize()'s resource check
-            # accepts the client's resource indicator.
-            provider._resource_url = self._real_resource
 
         # Single, header-aware protected-resource metadata (RFC 9728).
         pr_path = urlparse(str(build_resource_metadata_url(self._real_resource))).path

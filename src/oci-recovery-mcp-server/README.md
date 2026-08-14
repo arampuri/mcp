@@ -42,7 +42,7 @@ ORACLE_MCP_AUTH_PROFILE=DEFAULT
 oci session authenticate --profile-name DEFAULT
 ```
 
-For API-key authentication, use `ORACLE_MCP_AUTH_METHOD=apikey`; the selected OCI profile must contain the normal API-key fields. The server defaults to stdio when `ORACLE_MCP_HOST` and `ORACLE_MCP_PORT` are unset:
+For API-key authentication, use `ORACLE_MCP_AUTH_METHOD=apikey`; the selected OCI profile must contain the normal API-key fields. The `session` and `apikey` methods run over stdio only:
 
 ```sh
 .venv/bin/oracle.oci-recovery-mcp-server
@@ -70,18 +70,23 @@ Configure an MCP client to start the installed entry point. For example:
 }
 ```
 
-To run a local HTTP listener for `session` or `apikey` mode, set both values below. This listener uses the server's local OCI credentials, so expose it only on a trusted network.
-
-```dotenv
-ORACLE_MCP_HOST=127.0.0.1
-ORACLE_MCP_PORT=7337
-```
+`session` and `apikey` mode cannot be served over a network listener: they carry the
+operator's own OCI credentials and have no per-caller authentication. Setting
+`ORACLE_MCP_HOST` and `ORACLE_MCP_PORT` in these modes fails startup; both variables are
+reserved for `oauth` mode. To expose this server over HTTP, use the hosted OAuth
+deployment below.
 
 ## Hosted multi-tenant OAuth
 
 OAuth mode runs one Streamable HTTP server for one or more tenancies. Each client sends `X-OCI-Tenancy` with the configured tenancy alias (or tenancy OCID) to select the correct sign-in and OCI request routing context. The tenancy registry, OAuth client secrets, signing keys, and OAuth state remain server-side.
 
-Set `ORACLE_MCP_AUTH_METHOD=oauth` and configure `ORACLE_MCP_TENANCY_REGISTRY`. Each registry entry supplies a tenancy OCID, IAM domain, confidential-client credentials, and OCI region. The supported single-tenant fallback is the legacy `ORACLE_MCP_IDCS_DOMAIN`, `ORACLE_MCP_IDCS_CLIENT_ID`, `ORACLE_MCP_IDCS_CLIENT_SECRET`, `ORACLE_MCP_TENANCY_ID`, and `ORACLE_MCP_REGION` variables.
+Set `ORACLE_MCP_AUTH_METHOD=oauth` and configure `ORACLE_MCP_TENANCY_REGISTRY`. Each registry entry supplies a tenancy OCID, IAM domain, confidential-client credentials, resource audience, and OCI region. The supported single-tenant fallback is the legacy `ORACLE_MCP_IDCS_DOMAIN`, `ORACLE_MCP_IDCS_CLIENT_ID`, `ORACLE_MCP_IDCS_CLIENT_SECRET`, `ORACLE_MCP_IDCS_AUDIENCE`, `ORACLE_MCP_TENANCY_ID`, and `ORACLE_MCP_REGION` variables.
+
+When registering the IAM domain integrated application for a tenancy, configure a
+**primary audience** on its resource application and put that exact value in the
+entry's `audience`. It is both the `aud` claim issued access tokens are verified
+against and the audience requested at `/authorize` and `/token`, so a value that does
+not match the domain's configuration makes every sign-in for that tenancy fail.
 
 `ORACLE_MCP_BASE_URL` is required and must be an absolute `https://` URL: this is what per-tenancy authorize/callback/well-known URLs are built from, so a missing or plain-HTTP value fails startup rather than silently advertising `http://localhost:8000`. Set `ORACLE_MCP_OAUTH_ALLOW_INSECURE_LOCAL=true` to allow an `http://localhost` base URL for local development only.
 
@@ -98,16 +103,25 @@ tenancy_id    = "ocid1.tenancy.oc1..aaaa"
 idcs_domain   = "idcs-aaaa.identity.oraclecloud.com"   # host or full https URL
 client_id     = "REPLACE_ME"
 client_secret = "REPLACE_ME"
+audience      = "REPLACE_ME"                           # resource app primary audience
 region        = "us-ashburn-1"
-# Optional: pin the token-signing key. If omitted, one is generated and
-# persisted per tenancy under ORACLE_MCP_OAUTH_STORAGE_DIR.
-# jwt_signing_key = "generate with: openssl rand -hex 32"
 ```
 
 This file holds OAuth client secrets and must never be committed or served. Restrict it
-to the service user (mode `640`). Per-tenancy OAuth state and signing keys are written
-under `ORACLE_MCP_OAUTH_STORAGE_DIR` (default `.oauth_state` in the working directory);
-treat that directory as secret material and exclude it from images and version control.
+to the service user (mode `640`).
+
+Per-tenancy OAuth state (client registrations and authorization state) is persisted and
+encrypted at rest by FastMCP under its home directory, `~/.fastmcp/oauth-proxy/` by
+default and relocatable with `FASTMCP_HOME`. The storage directory and the token-signing
+key are both derived from each tenancy's `client_secret`, so tenancies stay isolated from
+one another and keys survive restarts and multiple workers without being stored in the
+registry. Treat that directory as secret material, exclude it from images, and give it
+persistent storage in a container deployment — a fresh directory on every restart forces
+all clients to re-register. Rotating a tenancy's `client_secret` invalidates its
+already-issued tokens, and its clients sign in again.
+
+The first authorization for a tenancy shows a consent screen; subsequent tool calls reuse
+the granted session.
 
 Run the HTTP listener behind a TLS-terminating reverse proxy and bind it to
 `127.0.0.1`. `ORACLE_MCP_BASE_URL` must be the public `https://` URL clients reach.
@@ -138,15 +152,13 @@ public root certificate. Distribute only the public root certificate, never the 
 | `ORACLE_MCP_AUTH_METHOD` | all | `session`, `apikey`, or `oauth`. Defaults to `session`. |
 | `ORACLE_MCP_AUTH_PROFILE` | session, apikey | Profile in `~/.oci/config`. Falls back to `OCI_CONFIG_PROFILE`, then `DEFAULT`. |
 | `ORACLE_MCP_ENV_FILE` | all | Path to a specific `.env` file instead of directory discovery. |
-| `ORACLE_MCP_HOST`, `ORACLE_MCP_PORT` | all | Bind address for the HTTP listener. Both must be set. Plain HTTP is rejected for `session`/`apikey` unless the listener is local-only. |
+| `ORACLE_MCP_HOST`, `ORACLE_MCP_PORT` | oauth | Bind address for the Streamable HTTP listener. Defaults to `127.0.0.1:8000`. Rejected in `session`/`apikey` mode, which run over stdio only. |
 | `ORACLE_MCP_TENANCY_REGISTRY` | oauth | Path to the server-side tenancy registry TOML. |
 | `ORACLE_MCP_BASE_URL` | oauth | Required. Absolute `https://` public URL used to build authorize, callback, and well-known URLs. |
 | `ORACLE_MCP_OAUTH_ALLOW_INSECURE_LOCAL` | oauth | Allows an unset or `http://localhost` base URL. Local development only. |
-| `ORACLE_MCP_OAUTH_STORAGE_DIR` | oauth | Directory for per-tenancy OAuth state and signing keys. Contains secret material. |
 | `ORACLE_MCP_OAUTH_SCOPES` | oauth | Requested scopes. Default includes `oci_mcp.recovery.invoke` and `offline_access`. |
-| `ORACLE_MCP_OAUTH_REQUIRE_CONSENT` | oauth | Keep `true` on shared deployments. |
-| `ORACLE_MCP_OAUTH_REDIRECT_PATH` | oauth | Callback path. Default `/auth/callback`. |
-| `ORACLE_MCP_TENANCY_ALIAS`, `ORACLE_MCP_IDCS_DOMAIN`, `ORACLE_MCP_IDCS_CLIENT_ID`, `ORACLE_MCP_IDCS_CLIENT_SECRET`, `ORACLE_MCP_TENANCY_ID`, `ORACLE_MCP_REGION`, `ORACLE_MCP_JWT_SIGNING_KEY` | oauth | Single-tenant fallback used when `ORACLE_MCP_TENANCY_REGISTRY` is unset. |
+| `FASTMCP_HOME` | oauth | FastMCP's home directory, where per-tenancy OAuth state is persisted. Contains secret material. |
+| `ORACLE_MCP_TENANCY_ALIAS`, `ORACLE_MCP_IDCS_DOMAIN`, `ORACLE_MCP_IDCS_CLIENT_ID`, `ORACLE_MCP_IDCS_CLIENT_SECRET`, `ORACLE_MCP_IDCS_AUDIENCE`, `ORACLE_MCP_TENANCY_ID`, `ORACLE_MCP_REGION` | oauth | Single-tenant fallback used when `ORACLE_MCP_TENANCY_REGISTRY` is unset. |
 | `ORACLE_MCP_INSTALLATION_ID`, `ORACLE_MCP_INSTALLATION_ID_FILE` | all | Stable installation identifier for telemetry. Set explicitly on shared deployments. |
 | `ORACLE_MCP_LOG_LEVEL`, `ORACLE_MCP_LOG_TO_STDOUT`, `ORACLE_MCP_LOG_DIR`, `ORACLE_MCP_LOG_FILE`, `ORACLE_SDK_LOG_LEVEL` | all | Logging configuration. |
 

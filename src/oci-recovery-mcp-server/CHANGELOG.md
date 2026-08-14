@@ -5,6 +5,61 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.1.0
+
+Hosted OAuth moves onto the shared `oracle-mcp-common` authentication path. The
+server no longer configures OAuth providers or builds token-exchange signers
+itself, which removes four local settings and requires one new one.
+
+### Breaking Changes
+
+- **Hosted `oauth` authentication now goes through `oracle-mcp-common` end to
+  end.** Each tenancy's provider is built by
+  `oracle_mcp_common.build_idcs_http_auth()`, and every request's OCI signer comes
+  from that tenancy's `IDCSHttpAuth.context_for()`. 3.0.0 used the shared library
+  only for `apikey`/`session` credential resolution and configured its own OAuth
+  providers and `TokenExchangeSigner`s; those local paths are gone.
+- **Tenancy registry entries now require `audience`.** Each entry must carry the
+  primary audience of that tenancy's IAM resource application (single-tenant
+  fallback: `ORACLE_MCP_IDCS_AUDIENCE`). Access tokens are now verified against
+  this `aud` claim and the value is sent to `/authorize` and `/token`, so it must
+  match the IAM domain's configuration or sign-in for that tenancy fails.
+- **Registry `jwt_signing_key` and `ORACLE_MCP_JWT_SIGNING_KEY` removed.** FastMCP
+  derives each tenancy's token-signing key from that tenancy's `client_secret`, so
+  it is stable across restarts and workers and distinct per tenancy without being
+  configured. A registry entry that still sets `jwt_signing_key` fails startup
+  rather than having the value silently ignored. Rotating a `client_secret` now
+  also invalidates that tenancy's issued tokens.
+- **`ORACLE_MCP_OAUTH_STORAGE_DIR` removed.** Per-tenancy OAuth state now lives
+  under FastMCP's home directory (`~/.fastmcp/oauth-proxy/`, relocatable with
+  `FASTMCP_HOME`), encrypted at rest, in a per-tenancy directory. Deployments that
+  mounted the old `.oauth_state` directory must persist the new location instead;
+  an ephemeral home directory forces clients to re-register after a restart.
+  `FASTMCP_HOME` is resolved when FastMCP is imported, before the server reads its
+  env file, so it must be exported rather than set in that file.
+- **`ORACLE_MCP_OAUTH_REQUIRE_CONSENT` removed and consent is now on.** The first
+  authorization for a tenancy shows a consent screen; later tool calls reuse the
+  granted session.
+- **`ORACLE_MCP_OAUTH_REDIRECT_PATH` removed.** The callback path is `/auth/callback`
+  under each tenancy's mount, so the registered redirect URI
+  `<base_url>/t/<alias>/auth/callback` is unchanged.
+
+### Fixed
+
+- **Compartment cache could serve one caller's compartments to another.** The
+  compartment listing is fetched with `access_level="ACCESSIBLE"`, so it contains
+  exactly what the calling identity may see, but it was cached per tenancy only. In
+  the hosted multi-tenant deployment two users of the same tenancy shared that
+  entry, so a broadly-permissioned user's compartment tree could be served to a
+  restricted one. The cache is now keyed by tenancy **and** caller identity; in
+  `session`/`apikey` mode, where the whole process shares one credential, the key is
+  unchanged.
+- Per-tenancy OAuth providers now derive their protected-resource URL from the
+  server's public base URL rather than their own `/t/<alias>` mount, so the resource
+  indicator a client sends is the one the provider validates and the one the tokens
+  it issues are bound to. Tokens issued by 3.0.0 carry the old audience and are
+  rejected; affected clients sign in again.
+
 ## 3.0.0
 
 ### Breaking Changes

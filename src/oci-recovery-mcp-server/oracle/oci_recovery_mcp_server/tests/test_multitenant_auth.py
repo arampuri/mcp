@@ -4,12 +4,12 @@ Licensed under the Universal Permissive License v1.0 as shown at
 https://oss.oracle.com/licenses/upl.
 """
 
-import os
-import stat
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
 import pytest
+from oracle_mcp_common import IDCSHttpAuth
 from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.oidc_proxy import OIDCConfiguration
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser, RequireAuthMiddleware
@@ -17,12 +17,8 @@ from starlette.applications import Starlette
 from starlette.authentication import AuthCredentials
 
 from oracle.oci_recovery_mcp_server import server
-from oracle.oci_recovery_mcp_server.multitenant_auth import (
-    TENANT_CLAIM,
-    MultiTenantOCIAuth,
-    load_or_create_signing_key,
-)
-from oracle.oci_recovery_mcp_server.tenancy_registry import TenancyRegistry
+from oracle.oci_recovery_mcp_server.multitenant_auth import TENANT_CLAIM, MultiTenantOCIAuth
+from oracle.oci_recovery_mcp_server.tenancy_registry import RegistryError, TenancyRegistry
 
 HOST = "https://mcp.example.com"
 
@@ -32,6 +28,7 @@ _REG = {
         "idcs_domain": "idcs-aaaa.identity.oraclecloud.com",
         "client_id": "client-one",
         "client_secret": "secret-one",
+        "audience": "https://recovery.t1.example.com",
         "region": "us-ashburn-1",
     },
     "t2": {
@@ -39,6 +36,7 @@ _REG = {
         "idcs_domain": "idcs-bbbb.identity.oraclecloud.com",
         "client_id": "client-two",
         "client_secret": "secret-two",
+        "audience": "https://recovery.t2.example.com",
         "region": "us-phoenix-1",
     },
 }
@@ -60,25 +58,85 @@ def _fake_oidc(cls, config_url, *, strict=None, timeout_seconds=None):
 
 
 @pytest.fixture
-def auth(tmp_path):
+def auth():
     reg = TenancyRegistry.from_mapping(_REG)
     with patch.object(OIDCConfiguration, "get_oidc_configuration", classmethod(_fake_oidc)):
         yield MultiTenantOCIAuth(
             reg,
             base_url=HOST,
-            storage_root=str(tmp_path),
             required_scopes=["openid", "offline_access"],
         )
 
 
-class TestSigningKey:
-    def test_persisted_once_with_0600(self, tmp_path):
-        k1 = load_or_create_signing_key(str(tmp_path), "t1")
-        k2 = load_or_create_signing_key(str(tmp_path), "t1")
-        assert k1 == k2 and len(k1) == 32  # stable, never regenerated
-        key_path = tmp_path / "t1" / "signing.key"
-        mode = stat.S_IMODE(os.stat(key_path).st_mode)
-        assert mode == 0o600
+class TestSharedIDCSHttpAuth:
+    """Every tenancy's auth comes from oracle-mcp-common, not from this server."""
+
+    def test_each_tenancy_is_built_by_the_shared_builder(self, auth):
+        for alias in ("t1", "t2"):
+            policy = auth.http_auth_for(alias)
+            assert isinstance(policy, IDCSHttpAuth)
+            # exactly one provider per tenancy: the mounted one is the built one
+            assert policy.provider is auth._providers[alias]
+        assert auth.http_auth_for("unknown") is None
+        assert auth.http_auth_for(None) is None
+
+    def test_builder_receives_only_this_tenancy_settings(self):
+        # Regression guard for cross-tenancy bleed: the shared builder falls back to
+        # process-wide IDCS_* env vars for anything not passed explicitly, so every
+        # field must come from the entry and base_url must be the tenancy's mount.
+        seen = {}
+
+        def fake_build(scopes, options):
+            seen[options.client_id] = (list(scopes), options)
+            return SimpleNamespace(provider=object())
+
+        reg = TenancyRegistry.from_mapping(_REG)
+        with patch(
+            "oracle.oci_recovery_mcp_server.multitenant_auth.build_idcs_http_auth",
+            side_effect=fake_build,
+        ):
+            MultiTenantOCIAuth(reg, base_url=HOST, required_scopes=["openid", "custom.scope"])
+
+        scopes, options = seen["client-two"]
+        assert scopes == ["openid", "custom.scope"]
+        assert options.domain == "idcs-bbbb.identity.oraclecloud.com"
+        assert options.client_secret == "secret-two"
+        assert options.audience == "https://recovery.t2.example.com"
+        assert options.region == "us-phoenix-1"
+        assert options.base_url == f"{HOST}/t/t2"
+
+    def test_policy_carries_the_tenancy_credentials_without_leaking_them(self, auth):
+        policy = auth.http_auth_for("t1")
+        assert policy._identity_domain_url == "https://idcs-aaaa.identity.oraclecloud.com"
+        assert policy._client_id == "client-one"
+        assert policy._client_secret == "secret-one"
+        assert policy._configured_region == "us-ashburn-1"
+        assert "secret-one" not in repr(policy)
+
+    def test_unusable_entry_names_the_tenancy(self):
+        bad = {**_REG, "t2": {**_REG["t2"], "idcs_domain": "idcs-bbbb.example.com/oauth2"}}
+        reg = TenancyRegistry.from_mapping(bad)
+        with patch.object(OIDCConfiguration, "get_oidc_configuration", classmethod(_fake_oidc)):
+            with pytest.raises(RegistryError, match=r"\[t2\]"):
+                MultiTenantOCIAuth(reg, base_url=HOST)
+
+
+class TestPerTenancyIsolation:
+    """FastMCP derives keys and state storage per tenancy from the client secret."""
+
+    def test_signing_keys_and_storage_differ_per_tenancy(self, auth):
+        p1, p2 = auth._providers["t1"], auth._providers["t2"]
+        assert p1._jwt_signing_key != p2._jwt_signing_key
+        assert p1._client_storage is not p2._client_storage
+
+    def test_signing_key_is_stable_across_restarts(self):
+        # Derived from the client secret rather than generated, so a restart (or a
+        # second worker) does not invalidate already-issued tokens.
+        reg = TenancyRegistry.from_mapping(_REG)
+        with patch.object(OIDCConfiguration, "get_oidc_configuration", classmethod(_fake_oidc)):
+            first = MultiTenantOCIAuth(reg, base_url=HOST)
+            second = MultiTenantOCIAuth(reg, base_url=HOST)
+        assert first._providers["t1"]._jwt_signing_key == second._providers["t1"]._jwt_signing_key
 
 
 class TestRoutes:
@@ -115,6 +173,15 @@ class TestRoutes:
             assert body["error"] == "tenancy_required"
             assert sorted(body["valid_tenancies"]) == ["t1", "t2"]
             assert "secret-one" not in r.text
+
+    def test_every_tenancy_protects_the_single_mcp_resource(self, auth):
+        # The mount /t/<alias> carries only that tenancy's OAuth routes; the resource
+        # being protected is the one /mcp endpoint. If a provider derived its resource
+        # from its own mount it would reject the resource indicator clients send.
+        auth.get_routes(mcp_path="/mcp")
+        for provider in auth._providers.values():
+            assert str(provider.resource_base_url).rstrip("/") == HOST
+            assert str(provider._get_resource_url("/mcp")) == f"{HOST}/mcp"
 
     @pytest.mark.asyncio
     async def test_operational_routes_mounted(self, auth):
@@ -215,6 +282,7 @@ class TestScopeEnforcement:
             "ORACLE_MCP_IDCS_DOMAIN": "idcs.example.com",
             "ORACLE_MCP_IDCS_CLIENT_ID": "client-id",
             "ORACLE_MCP_IDCS_CLIENT_SECRET": "client-secret",
+            "ORACLE_MCP_IDCS_AUDIENCE": "https://recovery.example.com",
             "ORACLE_MCP_TENANCY_ID": "ocid1.tenancy.oc1..example",
             "ORACLE_MCP_REGION": "us-ashburn-1",
             "ORACLE_MCP_BASE_URL": "https://mcp.example.com",

@@ -20,8 +20,13 @@ https://oss.oracle.com/licenses/upl.
 #   idcs_domain   = "idcs-xxxx.identity.oraclecloud.com"
 #   client_id     = "..."
 #   client_secret = "..."
+#   audience      = "https://<resource-app-primary-audience>"
 #   region        = "us-ashburn-1"
-#   # optional: jwt_signing_key = "..."   (else a key is generated + persisted per alias)
+#
+# `audience` is the primary audience of the tenancy's IAM resource application. It is
+# both the `aud` claim the issued access token is verified against and the audience
+# requested at /authorize and /token, so it must match that domain's configuration
+# exactly; it is per tenancy and is never defaulted from another tenancy's value.
 #
 # The TOML table name is the alias (used in OAuth route paths, so it must be URL-safe).
 
@@ -36,7 +41,23 @@ from typing import Optional
 # `_select` is reserved for the no-header tenant-selection facade (see multitenant_auth).
 _RESERVED_ALIASES = {"_select"}
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-_REQUIRED_FIELDS = ("tenancy_id", "idcs_domain", "client_id", "client_secret", "region")
+_REQUIRED_FIELDS = (
+    "tenancy_id",
+    "idcs_domain",
+    "client_id",
+    "client_secret",
+    "audience",
+    "region",
+)
+# Settings that used to be honored here but are now owned by the shared
+# oracle-mcp-common provider builder. Rejected loudly rather than ignored: a
+# silently dropped signing key would look configured while doing nothing.
+_REMOVED_FIELDS = {
+    "jwt_signing_key": (
+        "the FastMCP token signing key is now derived from this tenancy's "
+        "client_secret, so it no longer needs to be configured or persisted"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -48,8 +69,8 @@ class TenancyEntry:
     idcs_domain: str
     client_id: str
     client_secret: str
+    audience: str
     region: str
-    jwt_signing_key: Optional[str] = None
 
     def __repr__(self) -> str:  # never leak secrets in logs/reprs
         return f"TenancyEntry(alias={self.alias!r}, tenancy_id={self.tenancy_id!r}, region={self.region!r})"
@@ -115,6 +136,13 @@ class TenancyRegistry:
                     f"Registry entry [{alias}] is missing required field(s): {', '.join(missing)}."
                 )
 
+            for removed, reason in _REMOVED_FIELDS.items():
+                if removed in body:
+                    raise RegistryError(
+                        f"Registry entry [{alias}] sets '{removed}', which is no longer "
+                        f"supported: {reason}. Remove the field."
+                    )
+
             # HTTPS-only: the IAM domain carries the OAuth/token-exchange flows.
             if str(body["idcs_domain"]).strip().lower().startswith("http://"):
                 raise RegistryError(
@@ -130,9 +158,6 @@ class TenancyRegistry:
                 )
             seen_ocids[tenancy_id] = alias
 
-            signing_key = body.get("jwt_signing_key")
-            signing_key = str(signing_key).strip() if signing_key else None
-
             entries.append(
                 TenancyEntry(
                     alias=alias,
@@ -140,8 +165,8 @@ class TenancyRegistry:
                     idcs_domain=str(body["idcs_domain"]).strip(),
                     client_id=str(body["client_id"]).strip(),
                     client_secret=str(body["client_secret"]).strip(),
+                    audience=str(body["audience"]).strip(),
                     region=str(body["region"]).strip(),
-                    jwt_signing_key=signing_key,
                 )
             )
 

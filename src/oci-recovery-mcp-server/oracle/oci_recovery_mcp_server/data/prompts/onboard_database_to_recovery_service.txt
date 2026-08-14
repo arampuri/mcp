@@ -183,7 +183,7 @@ Possible information includes, depending on current Oracle documentation and dep
 	•	DNS configuration;
 	•	IAM policies;
 	•	authentication configuration;
-	•	database wallet/encryption requirements, only for on-premise database; 
+	•	database wallet/encryption requirements, only for on-premise database;
 	•	database service configuration;
 	•	Oracle software owner;
 	•	OSBACKUPDBA group membership;
@@ -283,7 +283,7 @@ Retrieve the current API/schema documentation before generating a request body o
 When applicable, inspect the existing database configuration before proposing changes so that unrelated settings are preserved.
 Apply documented service defaults when the operator has not explicitly provided optional values.
 Do not clear, replace, or modify unrelated DbBackupConfig properties unless required by the approved onboarding operation and current API semantics.
-Enable the option to take the first full backup immediately 
+Enable the option to take the first full backup immediately
 ON-PREMISES CLOUD PROTECT PREREQUISITE WORKFLOW
 If the database is confirmed and approved as pure on-premises, evaluate the current mandatory requirements for onboarding to Recovery Service using Cloud Protect.
 Use your judgment and current Oracle documentation to identify all required checks.

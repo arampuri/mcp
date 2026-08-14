@@ -55,6 +55,7 @@ from oci.monitoring.models import SummarizeMetricsDataDetails
 from oracle_mcp_common import (
     AuthOptions,
     AuthType,
+    IDCSHttpAuth,
     build_auth_context,
     resolve_config_file,
 )
@@ -97,7 +98,7 @@ from oracle.oci_recovery_mcp_server.models import (
 )
 
 from . import __project__, __version__
-from .multitenant_auth import TENANT_CLAIM, MultiTenantOCIAuth, _domain_to_url
+from .multitenant_auth import TENANT_CLAIM, MultiTenantOCIAuth
 from .tenancy_registry import (
     RegistryError,
     TenancyEntry,
@@ -652,11 +653,13 @@ def _effective_auth_method() -> Literal["session", "apikey", "oauth"]:
       - ORACLE_MCP_AUTH_PROFILE: OCI config profile name (defaults to OCI_CONFIG_PROFILE/DEFAULT)
 
     Modes:
-      - "session" / "apikey": local ~/.oci/config based auth. Works over stdio (default)
-        or the plain HTTP transport (ORACLE_MCP_HOST/ORACLE_MCP_PORT).
+      - "session" / "apikey": local ~/.oci/config based auth, stdio only. These carry the
+        operator's own OCI credentials and have no per-caller authentication, so main()
+        rejects ORACLE_MCP_HOST/ORACLE_MCP_PORT in these modes.
       - "oauth": OCI IAM (IDCS) domain OAuth + UPST token exchange, served over the
-        streamable HTTP transport. No local OCI config file is needed; a per-request
-        UPST signer is built from the authenticated user's IAM domain access token.
+        streamable HTTP transport (ORACLE_MCP_HOST/ORACLE_MCP_PORT apply here only). No
+        local OCI config file is needed; a per-request UPST signer is built from the
+        authenticated user's IAM domain access token.
     """
     m = (os.getenv("ORACLE_MCP_AUTH_METHOD") or "session").strip().lower()
     if m in ("apikey", "api_key", "api-key"):
@@ -730,16 +733,18 @@ def _build_profile_auth_context():
 # verified token carries the tenant alias (oracle_mcp_tenant_alias claim), which is
 # AUTHORITATIVE for all tool routing.
 #
-# Each tool call exchanges the user's IAM domain JWT for an OCI UPST token using
-# TokenExchangeSigner (built from the resolved tenancy's IDCS domain + credentials).
-# A fresh signer is built for every call: it carries the caller's own IAM domain JWT,
-# so nothing here is cached process-wide outside the request that established it.
+# Each tool call exchanges the user's IAM domain JWT for an OCI UPST token through
+# oracle-mcp-common: one IDCSHttpAuth per tenancy is created at startup with that
+# tenancy's provider, and context_for() mints the signer. A fresh signer is built for
+# every call: it carries the caller's own IAM domain JWT, so nothing here is cached
+# process-wide outside the request that established it.
 
 # Legacy single-tenant env vars: used to synthesize a one-entry registry when no
 # registry file is configured (backward compatibility / simple single-tenant hosting).
 _ENV_IDCS_DOMAIN = ("ORACLE_MCP_IDCS_DOMAIN", "IDCS_DOMAIN")
 _ENV_IDCS_CLIENT_ID = ("ORACLE_MCP_IDCS_CLIENT_ID", "IDCS_CLIENT_ID")
 _ENV_IDCS_CLIENT_SECRET = ("ORACLE_MCP_IDCS_CLIENT_SECRET", "IDCS_CLIENT_SECRET")
+_ENV_IDCS_AUDIENCE = ("ORACLE_MCP_IDCS_AUDIENCE", "IDCS_AUDIENCE")
 
 _registry_singleton: Optional[TenancyRegistry] = None
 _registry_lock = threading.Lock()
@@ -750,9 +755,10 @@ def _legacy_single_tenant_registry() -> Optional[TenancyRegistry]:
     domain = _first_env(*_ENV_IDCS_DOMAIN)
     client_id = _first_env(*_ENV_IDCS_CLIENT_ID)
     client_secret = _first_env(*_ENV_IDCS_CLIENT_SECRET)
+    audience = _first_env(*_ENV_IDCS_AUDIENCE)
     tenancy_id = _first_env("ORACLE_MCP_TENANCY_ID", "TENANCY_ID_OVERRIDE")
     region = _first_env("ORACLE_MCP_REGION", "OCI_REGION")
-    if not (domain and client_id and client_secret and tenancy_id and region):
+    if not (domain and client_id and client_secret and audience and tenancy_id and region):
         return None
     alias = _first_env("ORACLE_MCP_TENANCY_ALIAS", default="default")
     body: dict[str, Any] = {
@@ -760,11 +766,9 @@ def _legacy_single_tenant_registry() -> Optional[TenancyRegistry]:
         "idcs_domain": domain,
         "client_id": client_id,
         "client_secret": client_secret,
+        "audience": audience,
         "region": region,
     }
-    signing_key = _first_env("ORACLE_MCP_JWT_SIGNING_KEY")
-    if signing_key:
-        body["jwt_signing_key"] = signing_key
     return TenancyRegistry.from_mapping({alias: body})
 
 
@@ -784,8 +788,8 @@ def _get_registry() -> TenancyRegistry:
                         "oauth mode requires either ORACLE_MCP_TENANCY_REGISTRY (a "
                         "tenancies.toml file) or the legacy single-tenant env vars "
                         "(ORACLE_MCP_IDCS_DOMAIN, ORACLE_MCP_IDCS_CLIENT_ID, "
-                        "ORACLE_MCP_IDCS_CLIENT_SECRET, ORACLE_MCP_TENANCY_ID, "
-                        "ORACLE_MCP_REGION)."
+                        "ORACLE_MCP_IDCS_CLIENT_SECRET, ORACLE_MCP_IDCS_AUDIENCE, "
+                        "ORACLE_MCP_TENANCY_ID, ORACLE_MCP_REGION)."
                     )
                 _registry_singleton = reg
     return _registry_singleton
@@ -846,39 +850,50 @@ def _current_tenancy() -> TenancyEntry:
     return entry
 
 
-def _build_token_exchange_signer(entry: TenancyEntry):
+def _tenancy_http_auth(entry: TenancyEntry) -> IDCSHttpAuth:
     """
-    Build a fresh TokenExchangeSigner for the current request's user + tenancy.
+    Return the shared oracle-mcp-common HTTP IDCS auth policy for a tenancy.
 
-    The IAM domain JWT is taken from the active request's access token and used
-    only for this call: it is never stored outside the request that established
-    the caller's identity, so a signer built for one caller can never be reused
-    for another.
+    The policy is created once per tenancy at startup, alongside that tenancy's
+    OAuth provider (see MultiTenantOCIAuth._build_http_auth), so exactly one
+    provider exists per tenancy. Everything from the caller's token onward --
+    the IAM token exchange and the OCI SDK credentials it yields -- is the shared
+    library's IDCSHttpAuth.context_for(); no credential code lives in this server.
+    """
+    provider = getattr(mcp, "auth", None)
+    http_auth = provider.http_auth_for(entry.alias) if isinstance(provider, MultiTenantOCIAuth) else None
+    if http_auth is None:
+        raise ValueError(
+            f"No hosted OAuth policy is configured for tenancy '{entry.alias}'. This "
+            "server must be running with ORACLE_MCP_AUTH_METHOD=oauth and the tenancy "
+            "present in the registry that built the auth provider."
+        )
+    return http_auth
+
+
+def _request_auth_context(entry: TenancyEntry, region: str | None = None):
+    """
+    Resolve request-scoped OCI credentials for the current caller + tenancy.
+
+    The IAM domain JWT is taken from the active request's access token and passed
+    to IDCSHttpAuth.context_for(), which returns a signer built for this request
+    only: it is never stored outside the request that established the caller's
+    identity, so a signer built for one caller can never be reused for another.
     """
     from fastmcp.server.dependencies import get_access_token
-    from oci.auth.signers import TokenExchangeSigner
 
     access_token = get_access_token()
-    token = access_token.token
-
-    # Newer OCI SDKs take the full domain URL (oci_domain_url); older ones take the
-    # domain id prefix (oci_domain_id). Pick whichever the installed SDK supports.
-    import inspect
-
-    tes_params = inspect.signature(TokenExchangeSigner.__init__).parameters
-    domain_kwargs: dict[str, str] = {}
-    if "oci_domain_url" in tes_params:
-        domain_kwargs["oci_domain_url"] = _domain_to_url(entry.idcs_domain)
-    else:
-        domain_kwargs["oci_domain_id"] = entry.idcs_domain.split(".")[0]
-
-    try:
-        signer = TokenExchangeSigner(
-            jwt_or_func=token,
-            client_id=entry.client_id,
-            client_secret=entry.client_secret,
-            **domain_kwargs,
+    if access_token is None or not getattr(access_token, "token", None):
+        raise ValueError(
+            "No authenticated access token on this request; oauth mode requires a "
+            "signed-in caller before OCI clients can be created."
         )
+
+    # Resolved before the try so a configuration error is never reported as an IAM
+    # rejection of the caller's token.
+    http_auth = _tenancy_http_auth(entry)
+    try:
+        return http_auth.context_for(access_token.token, region=region)
     except Exception as e:
         # Surface the IAM domain's actual error body instead of a bare
         # "401 Unauthorized". A 401/403 here almost always means the OCI side is
@@ -887,7 +902,9 @@ def _build_token_exchange_signer(entry: TenancyEntry):
         # the token-exchange/client-credentials grant, or wrong client credentials.
         # Note: we log the tenancy alias (never the client secret) plus the IAM
         # error body, which is a diagnostic description and contains no secrets.
-        resp = getattr(e, "response", None)
+        # context_for() wraps SDK failures in ValueError, so the IAM response hangs
+        # off the wrapped cause.
+        resp = getattr(e, "response", None) or getattr(getattr(e, "__cause__", None), "response", None)
         detail = ""
         if resp is not None:
             try:
@@ -907,8 +924,6 @@ def _build_token_exchange_signer(entry: TenancyEntry):
             "confidential app has the Authorization Code and Client Credentials grants; "
             "(3) the registry's client_id/client_secret are correct." + detail
         ) from e
-
-    return signer
 
 
 def _oauth_base_config(entry: TenancyEntry, region: str | None = None) -> dict:
@@ -950,16 +965,19 @@ def _make_client(
     """
     Construct and wrap an OCI SDK client using the effective auth method.
 
-    - oauth: minimal regional config + per-request UPST TokenExchangeSigner.
+    - oauth: minimal regional config + the per-request UPST signer that
+      oracle_mcp_common.IDCSHttpAuth.context_for() builds from the caller's own
+      access token (see _request_auth_context()).
     - apikey/session: oracle_mcp_common.build_auth_context() resolves the
       profile-backed OCI config and signer (see _build_profile_auth_context()).
     """
     method = _effective_auth_method()
     if method == "oauth":
         entry = _current_tenancy()
-        config = _oauth_base_config(entry, region)
-        signer = _build_token_exchange_signer(entry)
-        client = ctor(config, signer=signer)
+        base_config = _oauth_base_config(entry, region)
+        auth_context = _request_auth_context(entry, base_config["region"])
+        config = {**base_config, **auth_context.config}
+        client = ctor(config, signer=auth_context.signer)
     else:
         auth_context = _build_profile_auth_context()
         config = {**auth_context.config, "additional_user_agent": f"{_USER_AGENT_NAME}/{__version__}"}
@@ -969,12 +987,6 @@ def _make_client(
 
     rid = request_id or uuid.uuid4().hex
     return _wrap_oci_client(client, request_id=rid, client_name=client_name)
-
-
-def _default_oauth_storage_root() -> str:
-    """Default per-tenant OAuth state location (overridable via env)."""
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-    return os.path.join(base_dir, ".oauth_state")
 
 
 _OAUTH_DEFAULT_SCOPES = "openid profile email offline_access oci_mcp.recovery.invoke"
@@ -1013,43 +1025,45 @@ def _validate_oauth_base_url(raw: Optional[str], *, allow_insecure_local: bool) 
     )
 
 
+def _oauth_public_base_url() -> str:
+    """The validated public OAuth base URL, shared by the provider and IDCS auth."""
+    return _validate_oauth_base_url(
+        _first_env("ORACLE_MCP_BASE_URL", "MCP_BASE_URL"),
+        allow_insecure_local=_env_bool("ORACLE_MCP_OAUTH_ALLOW_INSECURE_LOCAL", default=False),
+    )
+
+
+def _oauth_required_scopes() -> list[str]:
+    """The scopes required of every authenticated caller in oauth mode."""
+    return (_first_env("ORACLE_MCP_OAUTH_SCOPES", default=_OAUTH_DEFAULT_SCOPES) or "").split()
+
+
 def _build_auth_provider():
     """
     Build the FastMCP auth provider for oauth mode (returns None otherwise).
 
     In oauth mode we serve many tenancies behind a single MCP URL via
-    MultiTenantOCIAuth, which builds one OCIProvider (OIDC proxy) per tenancy from
-    the server-side registry. Persistence knobs (consent off, persisted per-tenant
-    signing keys, on-disk client storage, offline_access scope) keep logins sticky
-    so users are not re-prompted on every tool call.
+    MultiTenantOCIAuth, which asks oracle-mcp-common's build_idcs_http_auth() for one
+    provider per registry tenancy. The offline_access scope in the default scope list
+    keeps logins sticky so users are not re-prompted on every tool call; signing keys
+    and OAuth state are persisted by FastMCP itself, derived per tenancy from that
+    tenancy's client secret.
     """
     if _effective_auth_method() != "oauth":
         return None
 
     registry = _get_registry()
-    allow_insecure_local = _env_bool("ORACLE_MCP_OAUTH_ALLOW_INSECURE_LOCAL", default=False)
-    base_url = _validate_oauth_base_url(
-        _first_env("ORACLE_MCP_BASE_URL", "MCP_BASE_URL"),
-        allow_insecure_local=allow_insecure_local,
-    )
-    storage_root = _first_env("ORACLE_MCP_OAUTH_STORAGE_DIR", default=_default_oauth_storage_root())
-    redirect_path = _first_env("ORACLE_MCP_OAUTH_REDIRECT_PATH", default="/auth/callback")
-    scopes = (_first_env("ORACLE_MCP_OAUTH_SCOPES", default=_OAUTH_DEFAULT_SCOPES) or "").split()
-    require_consent = _env_bool("ORACLE_MCP_OAUTH_REQUIRE_CONSENT", default=False)
+    base_url = _oauth_public_base_url()
 
     logger.info(
-        "Configuring multi-tenant OCI IAM OAuth (tenancies=%d, base_url=%s, consent=%s)",
+        "Configuring multi-tenant OCI IAM OAuth (tenancies=%d, base_url=%s)",
         len(registry),
         base_url,
-        require_consent,
     )
     return MultiTenantOCIAuth(
         registry,
         base_url=base_url,
-        storage_root=storage_root,
-        required_scopes=scopes,
-        require_authorization_consent=require_consent,
-        redirect_path=redirect_path,
+        required_scopes=_oauth_required_scopes(),
     )
 
 
@@ -1152,6 +1166,41 @@ def _tenant_cache_key() -> str:
         return "_default"
 
 
+def _caller_cache_key() -> str:
+    """
+    Stable per-caller key for caches whose contents depend on the caller's own
+    OCI permissions, appended to the tenant key.
+
+    Tenant partitioning alone is not enough for those: in oauth mode every caller
+    in a tenancy has their own IAM permissions, so a result computed with one
+    caller's authorizations (anything fetched with access_level="ACCESSIBLE")
+    must never be served to another. In session/apikey mode there is exactly one
+    set of credentials for the whole process, so there is nothing to separate and
+    this contributes nothing to the key.
+
+    The subject claim identifies the human, not the session, so the cache still
+    survives a token refresh. It is hashed because these keys are cheap to end up
+    in a log line or a debug dump.
+    """
+    if _effective_auth_method() != "oauth":
+        return ""
+    try:
+        from fastmcp.server.dependencies import get_access_token
+
+        access = get_access_token()
+        claims = (getattr(access, "claims", None) or {}) if access is not None else {}
+        subject = claims.get("sub") or getattr(access, "client_id", None)
+        # No usable identity: fall back to the raw token so the entry is scoped to
+        # this session only. Never fall back to a shared key -- that is the leak.
+        subject = subject or getattr(access, "token", None)
+    except Exception:
+        subject = None
+    if not subject:
+        # No request context at all (e.g. startup): don't touch a shared entry.
+        return f"anon:{uuid.uuid4().hex}"
+    return "sub:" + hashlib.sha256(str(subject).encode()).hexdigest()[:16]
+
+
 _REGION_CACHE: dict[str, Any] = {
     "ttl_seconds": int(os.getenv("ORACLE_MCP_REGION_CACHE_TTL_SECONDS", "3600")),
     # items: dict[tenant_key -> {"regions": list[dict], "fetched_at": float}]
@@ -1239,7 +1288,7 @@ def list_all_compartments_internal(only_one_page: bool, limit=100):
 
 _COMPARTMENT_CACHE: dict[str, Any] = {
     "ttl_seconds": int(os.getenv("ORACLE_MCP_COMPARTMENT_CACHE_TTL_SECONDS", "300")),
-    # entries: dict[tenant_key -> {"items": list[Any], "fetched_at": float}]
+    # entries: dict["<tenant_key>|<caller_key>" -> {"items": list[Any], "fetched_at": float}]
     "entries": {},
 }
 
@@ -1248,6 +1297,11 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
     """
     Return all accessible ACTIVE compartments in the tenancy (plus root tenancy)
     with a small in-process TTL cache to avoid repeated Identity scans.
+
+    The cache is keyed by tenant AND caller: the listing is fetched with
+    access_level="ACCESSIBLE", so it contains exactly the compartments the calling
+    identity may see. Keying it by tenant alone would let one user's compartment
+    tree be served to a differently-authorized user in the same tenancy.
 
     NOTE:
     - OCI CLI `oci iam compartment list --compartment-id <root>` returns ONLY direct children.
@@ -1258,8 +1312,8 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
     now = time.time()
     ttl = float(_COMPARTMENT_CACHE.get("ttl_seconds") or 300)
     entries = _COMPARTMENT_CACHE.setdefault("entries", {})
-    tenant_key = _tenant_cache_key()
-    cached = entries.get(tenant_key)
+    cache_key = f"{_tenant_cache_key()}|{_caller_cache_key()}"
+    cached = entries.get(cache_key)
 
     if cached and cached.get("items") and (now - float(cached.get("fetched_at") or 0.0)) < ttl:
         return cached["items"]  # type: ignore[return-value]
@@ -1307,7 +1361,7 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
         )
         comps = []
 
-    entries[tenant_key] = {"items": comps, "fetched_at": now}
+    entries[cache_key] = {"items": comps, "fetched_at": now}
     return comps
 
 
