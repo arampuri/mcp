@@ -88,7 +88,13 @@ class TestSharedIDCSHttpAuth:
 
         def fake_build(scopes, options):
             seen[options.client_id] = (list(scopes), options)
-            return SimpleNamespace(provider=object())
+            # _cimd_manager must exist: the server clears it on every provider,
+            # and update_default_scopes is how it qualifies the resource scopes.
+            return SimpleNamespace(
+                provider=SimpleNamespace(
+                    _cimd_manager=object(), update_default_scopes=lambda scopes: None
+                )
+            )
 
         reg = TenancyRegistry.from_mapping(_REG)
         with patch(
@@ -118,6 +124,158 @@ class TestSharedIDCSHttpAuth:
         reg = TenancyRegistry.from_mapping(bad)
         with patch.object(OIDCConfiguration, "get_oidc_configuration", classmethod(_fake_oidc)):
             with pytest.raises(RegistryError, match=r"\[t2\]"):
+                MultiTenantOCIAuth(reg, base_url=HOST)
+
+
+class TestCIMDDisabled:
+    """Client registration must never depend on this host's outbound internet."""
+
+    def test_cimd_manager_cleared_on_every_provider(self, auth):
+        for alias, provider in auth._providers.items():
+            assert provider._cimd_manager is None, alias
+
+    @pytest.mark.asyncio
+    async def test_metadata_does_not_advertise_cimd(self, auth):
+        # The advertisement is what makes a client send a URL as its client_id.
+        # While it is present, Claude Code never falls back to DCR, and the
+        # server answers /authorize with a 400 it cannot recover from.
+        app = Starlette(routes=auth.get_routes(mcp_path="/mcp"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            for alias in ("t1", "t2"):
+                r = await client.get(f"/.well-known/oauth-authorization-server/t/{alias}")
+                assert r.status_code == 200
+                assert "client_id_metadata_document_supported" not in r.json()
+                # DCR stays advertised: it is the fallback clients must now use.
+                assert r.json()["registration_endpoint"] == f"{HOST}/t/{alias}/register"
+
+    def test_startup_fails_if_fastmcp_renames_the_attribute(self):
+        # A silent no-op here would restore the outbound fetch without warning,
+        # so an upstream rename must break startup rather than login.
+        reg = TenancyRegistry.from_mapping(_REG)
+        with patch(
+            "oracle.oci_recovery_mcp_server.multitenant_auth.build_idcs_http_auth",
+            return_value=SimpleNamespace(provider=object()),
+        ):
+            with pytest.raises(RegistryError, match="_cimd_manager"):
+                MultiTenantOCIAuth(reg, base_url=HOST)
+
+
+class TestDiscoveryWithoutTheHeader:
+    """OAuth discovery has nowhere to carry X-OCI-Tenancy."""
+
+    @pytest.fixture
+    def solo(self):
+        reg = TenancyRegistry.from_mapping({"t1": _REG["t1"]})
+        with patch.object(OIDCConfiguration, "get_oidc_configuration", classmethod(_fake_oidc)):
+            yield MultiTenantOCIAuth(reg, base_url=HOST, required_scopes=["openid"])
+
+    @pytest.mark.asyncio
+    async def test_single_tenancy_answers_discovery_without_the_header(self, solo):
+        # A client fetches /.well-known/... before any MCP session exists and sends
+        # no custom headers on it. Answering 400 here makes it retry root well-known
+        # paths that do not exist, and the 404 body surfaces as an unparseable
+        # OAuth error rather than as a missing-tenancy message.
+        app = Starlette(routes=solo.get_routes("/mcp"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url=HOST) as c:
+            r = await c.get("/.well-known/oauth-protected-resource/mcp")
+            assert r.status_code == 200
+            assert r.json()["authorization_servers"] == [f"{HOST}/t/t1"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_header_is_still_rejected_with_one_tenancy(self, solo):
+        # Only an absent header is unambiguous. A named tenancy that does not exist
+        # is a mistake worth reporting, not something to quietly substitute.
+        app = Starlette(routes=solo.get_routes("/mcp"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url=HOST) as c:
+            r = await c.get(
+                "/.well-known/oauth-protected-resource/mcp",
+                headers={"X-OCI-Tenancy": "nope"},
+            )
+            assert r.status_code == 400
+            assert r.json()["error"] == "tenancy_required"
+
+
+class TestUpstreamScopeQualification:
+    """IDCS wants resource scopes qualified going out and returns them bare."""
+
+    @pytest.fixture
+    def scoped_auth(self):
+        reg = TenancyRegistry.from_mapping(_REG)
+        with patch.object(OIDCConfiguration, "get_oidc_configuration", classmethod(_fake_oidc)):
+            yield MultiTenantOCIAuth(
+                reg,
+                base_url=HOST,
+                required_scopes=["openid", "offline_access", "oci_mcp.recovery.invoke"],
+            )
+
+    def test_resource_scope_is_qualified_with_that_tenancy_audience(self, scoped_auth):
+        # IDCS names the scope by concatenating the resource application's primary
+        # audience with the scope, no separator -- the `fqs` onboard.sh grants. The
+        # bare name is not a scope IDCS knows, and /authorize answers invalid_scope.
+        for alias, entry_audience in (
+            ("t1", "https://recovery.t1.example.com"),
+            ("t2", "https://recovery.t2.example.com"),
+        ):
+            advertised = scoped_auth._providers[alias]._default_scope_str.split()
+            assert f"{entry_audience}oci_mcp.recovery.invoke" in advertised
+            # Each tenancy qualifies with its own audience, never another's.
+            assert not any(s.startswith("https://recovery.t2.") for s in advertised) or alias == "t2"
+
+    def test_reserved_oidc_scopes_are_left_bare(self, scoped_auth):
+        advertised = scoped_auth._providers["t1"]._default_scope_str.split()
+        assert "openid" in advertised
+        assert "offline_access" in advertised
+
+    def test_required_scopes_stay_bare_for_verification(self, scoped_auth):
+        # The IDCS access token carries the scope bare in its `scope` claim, and
+        # that token is re-validated on every request against required_scopes.
+        # Qualifying these too would fail every call with 401 invalid_token.
+        assert list(scoped_auth.required_scopes) == [
+            "openid",
+            "offline_access",
+            "oci_mcp.recovery.invoke",
+        ]
+        for alias in ("t1", "t2"):
+            assert "oci_mcp.recovery.invoke" in scoped_auth._providers[alias].required_scopes
+
+    @pytest.mark.asyncio
+    async def test_protected_resource_metadata_advertises_the_qualified_form(self, scoped_auth):
+        # A client requests the scopes it is told are supported. Advertising the
+        # bare name here made the proxy reject its own client's authorize request
+        # with "Requested scopes are not valid", even though DCR was correct.
+        app = Starlette(routes=scoped_auth.get_routes("/mcp"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url=HOST) as c:
+            r = await c.get(
+                "/.well-known/oauth-protected-resource/mcp",
+                headers={"X-OCI-Tenancy": "t1"},
+            )
+            assert r.status_code == 200
+            supported = r.json()["scopes_supported"]
+            assert "https://recovery.t1.example.comoci_mcp.recovery.invoke" in supported
+            assert "oci_mcp.recovery.invoke" not in supported
+
+    def test_every_advertised_surface_agrees(self, scoped_auth):
+        # DCR defaults and protected-resource metadata are two different code
+        # paths; if they disagree the client requests scopes the proxy refuses.
+        for alias in ("t1", "t2"):
+            assert (
+                sorted(scoped_auth._client_scopes[alias])
+                == sorted(scoped_auth._providers[alias]._default_scope_str.split())
+            )
+
+    def test_startup_fails_if_fastmcp_drops_the_method(self):
+        # Silently skipping qualification would break sign-in for every tenancy
+        # with an invalid_scope the user cannot act on.
+        reg = TenancyRegistry.from_mapping(_REG)
+        with patch(
+            "oracle.oci_recovery_mcp_server.multitenant_auth.build_idcs_http_auth",
+            return_value=SimpleNamespace(provider=SimpleNamespace(_cimd_manager=object())),
+        ):
+            with pytest.raises(RegistryError, match="update_default_scopes"):
                 MultiTenantOCIAuth(reg, base_url=HOST)
 
 

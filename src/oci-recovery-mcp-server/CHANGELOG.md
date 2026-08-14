@@ -44,8 +44,43 @@ itself, which removes four local settings and requires one new one.
   under each tenancy's mount, so the registered redirect URI
   `<base_url>/t/<alias>/auth/callback` is unchanged.
 
+### Changed
+
+- **CIMD client registration is disabled.** FastMCP enables Client ID Metadata
+  Documents by default, which lets a client send an HTTPS URL as its `client_id`
+  and requires this server to fetch that URL to learn the client's metadata. That
+  fetch is an outbound internet request made with pinned DNS and redirects
+  disabled, so it fails on a host with no egress, and also on one whose egress is
+  a CONNECT proxy. The failure reached the user as "The client ID ... was not
+  found in the server's client registry" at `/authorize`, which reads like a
+  client bug. Clients now register with DCR against `/t/<alias>/register`, which
+  never leaves the host. Startup fails loudly if a future FastMCP release renames
+  the private attribute this relies on.
+
 ### Fixed
 
+- **Sign-in failed with `invalid_scope` because resource scopes were sent to IDCS
+  unqualified.** IDCS names a resource application's scopes by concatenating the
+  application's primary audience with the scope name, and `/authorize` accepts
+  only that form, so `oci_mcp.recovery.invoke` was rejected and no tenancy could
+  complete a login. The access token IDCS issues carries the scope *bare*,
+  though, and that token is re-validated on every request — so qualifying the
+  configured value instead simply moved the failure to `401 invalid_token` on
+  the first tool call. `ORACLE_MCP_OAUTH_SCOPES` is now bare, as verification
+  requires, and each tenancy's provider qualifies the resource scopes it
+  advertises to clients with that tenancy's own audience — in DCR defaults and
+  in protected-resource metadata alike, since a client requests whatever it is
+  told is supported and the proxy refuses an authorize request carrying anything
+  else. Startup fails loudly if a future FastMCP release drops the method this
+  relies on.
+- **OAuth discovery required a header no client can send there.** Protected-resource
+  metadata is fetched before any MCP session exists, and `X-OCI-Tenancy` rides only
+  on requests to the MCP URL itself, so discovery always arrived without it and was
+  answered with `tenancy_required`. Clients then retried root well-known paths this
+  server does not serve, and the resulting `404 Not Found` body reached the user as
+  an unparseable OAuth error. When exactly one tenancy is configured there is nothing
+  to disambiguate, so discovery is now answered for it. An unknown tenancy name is
+  still rejected, and a multi-tenancy registry still requires the header.
 - **Compartment cache could serve one caller's compartments to another.** The
   compartment listing is fetched with `access_level="ACCESSIBLE"`, so it contains
   exactly what the calling identity may see, but it was cached per tenancy only. In

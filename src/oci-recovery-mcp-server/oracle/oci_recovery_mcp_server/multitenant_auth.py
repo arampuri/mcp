@@ -61,6 +61,90 @@ logger = get_logger(__name__)
 
 TENANT_CLAIM = "oracle_mcp_tenant_alias"
 
+# Scopes IDCS defines itself, which are never namespaced by a resource application.
+# Everything else in ORACLE_MCP_OAUTH_SCOPES belongs to this server's resource
+# application and must be qualified with that application's primary audience.
+_IDCS_RESERVED_SCOPES = frozenset(
+    {"openid", "profile", "email", "address", "phone", "groups", "offline_access"}
+)
+
+
+def _qualify_upstream_scopes(
+    provider, *, alias: str, audience: str, scopes: list[str]
+) -> list[str]:
+    """Request resource scopes from IDCS in the fully-qualified form it requires.
+
+    IDCS names a resource application's scopes by concatenating the application's
+    primary audience with the scope, without a separator -- the `fqs` value that
+    onboard.sh grants to the confidential client. `/authorize` only recognizes that
+    form, so a bare `oci_mcp.recovery.invoke` is rejected with `invalid_scope` and
+    sign-in never completes.
+
+    The access token IDCS issues, however, carries the scope *bare* in its `scope`
+    claim, with the audience in `aud`. That token is what gets re-validated on every
+    request (OAuthProxy.load_access_token swaps the FastMCP JWT for it), and the
+    verifier requires `required_scopes` to be a subset of that claim. So the same
+    setting is needed in two incompatible forms: qualified going out, bare coming
+    back. Configuring either one alone breaks the other half of the flow.
+
+    We therefore keep `required_scopes` bare -- it is what verification and the
+    bearer-scope check compare against -- and qualify only the scopes advertised to
+    clients, which is what a client requests and what the upstream authorize URL is
+    built from. Reserved OIDC scopes and anything already absolute are left alone.
+
+    Returns the qualified list so every surface that advertises scopes to clients
+    can use it. All of them must agree: a client takes the scopes it requests from
+    what we advertise, and the proxy rejects an authorize request whose scopes are
+    not in this list ("Requested scopes are not valid").
+    """
+    if not hasattr(provider, "update_default_scopes"):
+        raise RegistryError(
+            f"Registry entry [{alias}] cannot be used for OAuth: this FastMCP release "
+            "does not expose 'update_default_scopes', so this tenancy's resource scopes "
+            "cannot be qualified with its audience and IDCS would reject sign-in with "
+            "'invalid_scope'."
+        )
+    qualified = [
+        s if (s in _IDCS_RESERVED_SCOPES or "://" in s) else f"{audience}{s}"
+        for s in scopes
+    ]
+    provider.update_default_scopes(qualified)
+    return qualified
+
+
+def _disable_cimd(provider, *, alias: str) -> None:
+    """Turn off CIMD client registration on one tenancy's provider.
+
+    CIMD (Client ID Metadata Document) lets a client present an HTTPS URL as its
+    `client_id`, which the server then fetches to learn that client's metadata.
+    FastMCP enables it by default, but the fetch is an outbound internet request
+    made from this process with pinned DNS and redirects disabled -- so it fails
+    on exactly the deployment this server is built for: a VM reachable only over
+    a VPN, whose egress is either absent or through a CONNECT proxy that a
+    pinned-DNS request cannot traverse. The failure surfaces to the user as
+    "The client ID ... was not found in the server's client registry", which
+    reads like a client bug rather than the network problem it is.
+
+    Clearing the manager both stops that lookup and stops advertising
+    `client_id_metadata_document_supported` in the authorization-server
+    metadata, so clients register with DCR against /t/<alias>/register instead --
+    an exchange that never leaves this host and works on every deployment.
+
+    `_cimd_manager` is private FastMCP API and there is no public alternative:
+    OCIProvider does not forward `enable_cimd` to the underlying proxy. The
+    attribute is therefore checked rather than assumed, so an upstream rename
+    fails at startup instead of silently restoring the outbound fetch.
+    """
+    if not hasattr(provider, "_cimd_manager"):
+        raise RegistryError(
+            f"Registry entry [{alias}] cannot be used for OAuth: this FastMCP release "
+            "does not expose '_cimd_manager', so CIMD client registration cannot be "
+            "disabled and client registration would depend on this host being able to "
+            "fetch the client's metadata URL. Check whether OCIProvider now accepts "
+            "enable_cimd=False and use that instead."
+        )
+    provider._cimd_manager = None
+
 
 class MultiTenantOCIAuth(AuthProvider):
     """Compose one OCIProvider per tenancy behind a single MCP URL, header-routed."""
@@ -76,6 +160,9 @@ class MultiTenantOCIAuth(AuthProvider):
         self._registry = registry
         self._root = str(self.base_url).rstrip("/")
         self._real_resource: Optional[AnyHttpUrl] = None
+        # Per-tenancy client-facing scopes, qualified with that tenancy's audience.
+        # Populated by _build_http_auth; see _qualify_upstream_scopes.
+        self._client_scopes: dict[str, list[str]] = {}
 
         self._http_auth = {e.alias: self._build_http_auth(e) for e in registry.entries}
         self._providers = {alias: h.provider for alias, h in self._http_auth.items()}
@@ -97,14 +184,15 @@ class MultiTenantOCIAuth(AuthProvider):
         provider advertise (and accept) /t/<alias>/authorize and
         /t/<alias>/auth/callback.
 
-        Nothing about the provider is configured locally: the token signing key and
-        the encrypted OAuth-state directory are derived by FastMCP from this
-        tenancy's client secret, and consent and the /auth/callback redirect path
-        take the shared library's defaults.
+        The token signing key and the encrypted OAuth-state directory are derived by
+        FastMCP from this tenancy's client secret, and consent and the /auth/callback
+        redirect path take the shared library's defaults. Two things the shared
+        builder cannot express are then applied to the provider: CIMD is turned off,
+        and this tenancy's resource scopes are qualified with its own audience.
         """
         alias = entry.alias
         try:
-            return build_idcs_http_auth(
+            http_auth = build_idcs_http_auth(
                 list(self.required_scopes),
                 IDCSHttpAuthOptions(
                     domain=entry.idcs_domain,
@@ -119,6 +207,15 @@ class MultiTenantOCIAuth(AuthProvider):
             # Name the tenancy: with many entries the shared message alone doesn't
             # say which registry table is at fault.
             raise RegistryError(f"Registry entry [{alias}] cannot be used for OAuth: {e}") from e
+
+        _disable_cimd(http_auth.provider, alias=alias)
+        self._client_scopes[alias] = _qualify_upstream_scopes(
+            http_auth.provider,
+            alias=alias,
+            audience=entry.audience,
+            scopes=list(self.required_scopes),
+        )
+        return http_auth
 
     def http_auth_for(self, alias: Optional[str]) -> Optional[IDCSHttpAuth]:
         """Return a tenancy's shared IDCS HTTP auth policy (None if unknown).
@@ -231,6 +328,29 @@ class MultiTenantOCIAuth(AuthProvider):
 
         hint = request.headers.get("x-oci-tenancy")
         entry = self._registry.lookup(hint)
+
+        if entry is None and not hint and len(self._registry) == 1:
+            # OAuth discovery carries no custom headers: a client fetches
+            # /.well-known/... before it has any MCP session, and X-OCI-Tenancy
+            # rides only on requests to the MCP URL itself. Demanding the header
+            # here makes discovery unanswerable, and clients respond by falling
+            # back to root well-known paths this server does not serve -- a 404
+            # that surfaces as an unparseable OAuth error rather than as the
+            # missing-tenancy problem it is.
+            #
+            # With exactly one tenancy configured there is nothing to disambiguate,
+            # so answer for it. This grants no access on its own: the token is
+            # still only accepted by the tenancy whose signing key verifies it.
+            # With several tenancies the request stays ambiguous and is rejected
+            # below; such a deployment needs clients that can reach a per-tenancy
+            # URL, not a guess about which tenancy was meant.
+            entry = self._registry.entries[0]
+            logger.info(
+                "protected-resource discovery without X-OCI-Tenancy; answering for the "
+                "only configured tenancy [%s]",
+                entry.alias,
+            )
+
         if entry is None:
             # No usable tenancy: tell the client exactly what to set (aliases only).
             logger.info(
@@ -254,7 +374,10 @@ class MultiTenantOCIAuth(AuthProvider):
             {
                 "resource": str(self._real_resource),
                 "authorization_servers": [f"{self._root}/t/{entry.alias}"],
-                "scopes_supported": list(self.required_scopes),
+                # The qualified form, matching what this tenancy's authorization
+                # server will accept: a client requests what we advertise here, and
+                # bare resource scopes are rejected at /authorize.
+                "scopes_supported": self._client_scopes[entry.alias],
                 "bearer_methods_supported": ["header"],
             }
         )

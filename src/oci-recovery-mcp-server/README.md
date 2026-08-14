@@ -92,6 +92,15 @@ not match the domain's configuration makes every sign-in for that tenancy fail.
 
 The default `ORACLE_MCP_OAUTH_SCOPES` includes `oci_mcp.recovery.invoke`, which gates access to this server's Recovery tools beyond a bare authenticated identity. If you override `ORACLE_MCP_OAUTH_SCOPES`, keep `oci_mcp.recovery.invoke` in the list.
 
+Write resource scopes **bare**, never qualified with the audience. IAM names a resource
+application's scopes by concatenating its primary audience with the scope name, and
+`/authorize` accepts only that form — but the access token it issues carries the scope
+bare, and that token is re-validated on every request against this same setting. The
+server reconciles the two: it verifies against the configured value and qualifies each
+tenancy's resource scopes with that tenancy's own audience before advertising them to
+clients. Qualifying them yourself produces `401 invalid_token` on the first tool call,
+after a sign-in that appeared to succeed.
+
 The registry is a TOML file with one table per tenancy. The table name is the URL-safe
 tenancy name (letters, digits, `-`, `_`) used both in the `X-OCI-Tenancy` header and in
 the per-tenancy OAuth callback path `<base_url>/t/TENANCY_NAME/auth/callback`, which must
@@ -122,6 +131,19 @@ already-issued tokens, and its clients sign in again.
 
 The first authorization for a tenancy shows a consent screen; subsequent tool calls reuse
 the granted session.
+
+Clients register through Dynamic Client Registration at `/t/TENANCY_NAME/register`, an
+exchange that never leaves the host, so authentication needs no outbound internet access.
+CIMD (Client ID Metadata Document) registration is deliberately disabled: it would let a
+client present an HTTPS URL as its `client_id` and require this server to fetch that URL,
+which fails on a network-restricted host and surfaces as `The client ID ... was not found
+in the server's client registry`.
+
+OAuth discovery cannot carry `X-OCI-Tenancy` — a client fetches the well-known metadata
+before it has an MCP session, and that header rides only on requests to the MCP URL. When
+exactly one tenancy is configured there is nothing to disambiguate, so discovery is
+answered for it. A multi-tenancy registry still requires the header, and therefore a
+client able to send it.
 
 Run the HTTP listener behind a TLS-terminating reverse proxy and bind it to
 `127.0.0.1`. `ORACLE_MCP_BASE_URL` must be the public `https://` URL clients reach.

@@ -461,8 +461,16 @@ class TestOAuthMode:
         captured = {}
 
         class FakeOCIProvider:
+            # _cimd_manager mirrors the real provider: the server clears it so
+            # client registration never depends on an outbound metadata fetch.
+            _cimd_manager = object()
+
             def __init__(self, **kwargs):
                 captured.update(kwargs)
+
+            def update_default_scopes(self, scopes):
+                # The real provider qualifies resource scopes with the audience.
+                captured["default_scopes"] = list(scopes)
 
         # Patch the provider inside oracle-mcp-common: the shared builder, not this
         # server, is what configures it.
