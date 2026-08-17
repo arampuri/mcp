@@ -464,6 +464,9 @@ class TestOAuthMode:
             # _cimd_manager mirrors the real provider: the server clears it so
             # client registration never depends on an outbound metadata fetch.
             _cimd_manager = object()
+            # Both are rewritten with the qualified scopes: required_scopes is the
+            # upstream authorize fallback, the hook builds the refresh request.
+            required_scopes: list[str] = []
 
             def __init__(self, **kwargs):
                 captured.update(kwargs)
@@ -471,6 +474,9 @@ class TestOAuthMode:
             def update_default_scopes(self, scopes):
                 # The real provider qualifies resource scopes with the audience.
                 captured["default_scopes"] = list(scopes)
+
+            def _prepare_scopes_for_upstream_refresh(self, scopes):
+                return scopes
 
         # Patch the provider inside oracle-mcp-common: the shared builder, not this
         # server, is what configures it.

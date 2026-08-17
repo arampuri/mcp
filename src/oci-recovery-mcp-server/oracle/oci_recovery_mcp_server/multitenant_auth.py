@@ -69,6 +69,14 @@ _IDCS_RESERVED_SCOPES = frozenset(
 )
 
 
+def _qualify(audience: str, scopes: list[str]) -> list[str]:
+    """Name each resource scope the way IDCS does: audience + scope, no separator."""
+    return [
+        s if (s in _IDCS_RESERVED_SCOPES or "://" in s) else f"{audience}{s}"
+        for s in scopes
+    ]
+
+
 def _qualify_upstream_scopes(
     provider, *, alias: str, audience: str, scopes: list[str]
 ) -> list[str]:
@@ -96,19 +104,65 @@ def _qualify_upstream_scopes(
     can use it. All of them must agree: a client takes the scopes it requests from
     what we advertise, and the proxy rejects an authorize request whose scopes are
     not in this list ("Requested scopes are not valid").
+
+    Three separate places build an upstream request, and each reads the scopes from
+    somewhere different, so all three have to be qualified:
+
+      * `update_default_scopes` covers DCR registration defaults, `valid_scopes`,
+        and the metadata clients read to decide what to request.
+      * `required_scopes` on the *proxy* is what `_build_upstream_authorize_url`
+        falls back to when the client sends no `scope` parameter at all -- which
+        clients do, and which no amount of correct advertising prevents. Leaving it
+        bare sends `oci_mcp.recovery.invoke` to /authorize and fails sign-in with
+        `invalid_scope`. This is safe to overwrite because the proxy's own
+        `required_scopes` is read *only* there; scope verification compares against
+        `token_verifier.required_scopes`, a different object that stays bare.
+      * `_prepare_scopes_for_upstream_refresh` builds the refresh request from the
+        scopes stored on the refresh token, and those were parsed from the IDCS
+        token response -- so they are bare. Left alone, sign-in succeeds and then
+        the session dies at the first refresh, an hour later, with the same
+        `invalid_scope` far from any change that would explain it.
+
+    FastMCP's own AzureProvider solves the same audience-qualification problem the
+    same way, which is why these are the hooks that exist to override.
     """
-    if not hasattr(provider, "update_default_scopes"):
+    for attr in (
+        "update_default_scopes",
+        "required_scopes",
+        "_prepare_scopes_for_upstream_refresh",
+    ):
+        if not hasattr(provider, attr):
+            raise RegistryError(
+                f"Registry entry [{alias}] cannot be used for OAuth: this FastMCP release "
+                f"does not expose '{attr}', so this tenancy's resource scopes cannot be "
+                "qualified with its audience and IDCS would reject sign-in with "
+                "'invalid_scope'."
+            )
+
+    if getattr(provider, "_verify_id_token", False) is True:
+        # OIDCProxy strips scopes off the verifier when it validates the id_token
+        # instead of the access token, and moves enforcement onto the provider's
+        # own required_scopes -- the field qualified just below. Under that mode
+        # the two uses collide again and qualifying would reject every request,
+        # so refuse rather than reintroduce the 401 loop silently.
         raise RegistryError(
-            f"Registry entry [{alias}] cannot be used for OAuth: this FastMCP release "
-            "does not expose 'update_default_scopes', so this tenancy's resource scopes "
-            "cannot be qualified with its audience and IDCS would reject sign-in with "
-            "'invalid_scope'."
+            f"Registry entry [{alias}] cannot be used for OAuth: its provider verifies "
+            "the id_token, which makes 'required_scopes' the scope-enforcement point as "
+            "well as the upstream authorize fallback. Those need opposite forms, so the "
+            "resource scopes cannot be qualified safely."
         )
-    qualified = [
-        s if (s in _IDCS_RESERVED_SCOPES or "://" in s) else f"{audience}{s}"
-        for s in scopes
-    ]
+
+    qualified = _qualify(audience, scopes)
     provider.update_default_scopes(qualified)
+    provider.required_scopes = qualified
+    # Bound per tenancy: the audience is this entry's, never another's. Falls back
+    # to the configured scopes when a refresh token carries none, mirroring what
+    # the authorize path does with an empty transaction.
+    provider._prepare_scopes_for_upstream_refresh = (
+        lambda stored, _aud=audience, _default=qualified: _qualify(
+            _aud, list(stored) or list(_default)
+        )
+    )
     return qualified
 
 

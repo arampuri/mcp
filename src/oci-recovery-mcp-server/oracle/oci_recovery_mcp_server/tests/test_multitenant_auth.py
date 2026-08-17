@@ -88,11 +88,14 @@ class TestSharedIDCSHttpAuth:
 
         def fake_build(scopes, options):
             seen[options.client_id] = (list(scopes), options)
-            # _cimd_manager must exist: the server clears it on every provider,
-            # and update_default_scopes is how it qualifies the resource scopes.
+            # _cimd_manager must exist: the server clears it on every provider.
+            # The other three are the surfaces it qualifies resource scopes on.
             return SimpleNamespace(
                 provider=SimpleNamespace(
-                    _cimd_manager=object(), update_default_scopes=lambda scopes: None
+                    _cimd_manager=object(),
+                    update_default_scopes=lambda scopes: None,
+                    required_scopes=[],
+                    _prepare_scopes_for_upstream_refresh=lambda scopes: scopes,
                 )
             )
 
@@ -231,15 +234,73 @@ class TestUpstreamScopeQualification:
 
     def test_required_scopes_stay_bare_for_verification(self, scoped_auth):
         # The IDCS access token carries the scope bare in its `scope` claim, and
-        # that token is re-validated on every request against required_scopes.
-        # Qualifying these too would fail every call with 401 invalid_token.
+        # that token is re-validated on every request against the *verifier's*
+        # required_scopes. Qualifying those would fail every call with 401
+        # invalid_token, so they must stay exactly as configured.
         assert list(scoped_auth.required_scopes) == [
             "openid",
             "offline_access",
             "oci_mcp.recovery.invoke",
         ]
         for alias in ("t1", "t2"):
-            assert "oci_mcp.recovery.invoke" in scoped_auth._providers[alias].required_scopes
+            provider = scoped_auth._providers[alias]
+            assert "oci_mcp.recovery.invoke" in provider._token_validator.required_scopes
+
+    def test_qualifying_is_refused_when_scopes_would_be_double_purposed(self):
+        # OIDCProxy moves scope enforcement onto the provider's required_scopes
+        # when it verifies the id_token -- the same field the authorize fallback
+        # reads. Qualifying it would then reject every request with 401
+        # invalid_token, so this must fail at startup instead.
+        reg = TenancyRegistry.from_mapping(_REG)
+        with patch(
+            "oracle.oci_recovery_mcp_server.multitenant_auth.build_idcs_http_auth",
+            return_value=SimpleNamespace(
+                provider=SimpleNamespace(
+                    _cimd_manager=object(),
+                    update_default_scopes=lambda scopes: None,
+                    required_scopes=[],
+                    _prepare_scopes_for_upstream_refresh=lambda scopes: scopes,
+                    _verify_id_token=True,
+                )
+            ),
+        ):
+            with pytest.raises(RegistryError, match="id_token"):
+                MultiTenantOCIAuth(reg, base_url=HOST)
+
+    def test_proxy_required_scopes_are_qualified_for_the_no_scope_fallback(self, scoped_auth):
+        # A client may send /authorize with no `scope` parameter at all, and no
+        # amount of correct advertising prevents that. _build_upstream_authorize_url
+        # then falls back to the proxy's own required_scopes, so leaving those bare
+        # sends `oci_mcp.recovery.invoke` upstream and IDCS answers invalid_scope.
+        # Distinct from the verifier's required_scopes checked above.
+        for alias, audience in (
+            ("t1", "https://recovery.t1.example.com"),
+            ("t2", "https://recovery.t2.example.com"),
+        ):
+            fallback = scoped_auth._providers[alias].required_scopes
+            assert f"{audience}oci_mcp.recovery.invoke" in fallback
+            assert "oci_mcp.recovery.invoke" not in fallback
+
+    def test_refresh_qualifies_the_bare_scopes_idcs_stored(self, scoped_auth):
+        # Refresh-token scopes were parsed from the IDCS token response, so they
+        # are bare. Replaying them verbatim kills the session at the first refresh
+        # -- an hour after a sign-in that looked completely successful.
+        prepare = scoped_auth._providers["t1"]._prepare_scopes_for_upstream_refresh
+        assert prepare(["openid", "oci_mcp.recovery.invoke"]) == [
+            "openid",
+            "https://recovery.t1.example.comoci_mcp.recovery.invoke",
+        ]
+
+    def test_refresh_without_stored_scopes_uses_the_configured_ones(self, scoped_auth):
+        prepare = scoped_auth._providers["t2"]._prepare_scopes_for_upstream_refresh
+        assert prepare([]) == scoped_auth._client_scopes["t2"]
+
+    def test_each_tenancy_refresh_uses_its_own_audience(self, scoped_auth):
+        # The hook closes over one entry's audience; a shared or late-bound value
+        # would send t1's audience on t2's refresh and reject the wrong tenancy.
+        t1 = scoped_auth._providers["t1"]._prepare_scopes_for_upstream_refresh
+        t2 = scoped_auth._providers["t2"]._prepare_scopes_for_upstream_refresh
+        assert t1(["oci_mcp.recovery.invoke"]) != t2(["oci_mcp.recovery.invoke"])
 
     @pytest.mark.asyncio
     async def test_protected_resource_metadata_advertises_the_qualified_form(self, scoped_auth):
@@ -267,15 +328,27 @@ class TestUpstreamScopeQualification:
                 == sorted(scoped_auth._providers[alias]._default_scope_str.split())
             )
 
-    def test_startup_fails_if_fastmcp_drops_the_method(self):
-        # Silently skipping qualification would break sign-in for every tenancy
-        # with an invalid_scope the user cannot act on.
+    @pytest.mark.parametrize(
+        "missing",
+        ["update_default_scopes", "required_scopes", "_prepare_scopes_for_upstream_refresh"],
+    )
+    def test_startup_fails_if_fastmcp_drops_any_hook(self, missing):
+        # Silently skipping qualification on any one surface breaks sign-in (or,
+        # for the refresh hook, breaks it an hour later) with an invalid_scope the
+        # user cannot act on. Each hook is named in its own error.
+        attrs = {
+            "_cimd_manager": object(),
+            "update_default_scopes": lambda scopes: None,
+            "required_scopes": [],
+            "_prepare_scopes_for_upstream_refresh": lambda scopes: scopes,
+        }
+        del attrs[missing]
         reg = TenancyRegistry.from_mapping(_REG)
         with patch(
             "oracle.oci_recovery_mcp_server.multitenant_auth.build_idcs_http_auth",
-            return_value=SimpleNamespace(provider=SimpleNamespace(_cimd_manager=object())),
+            return_value=SimpleNamespace(provider=SimpleNamespace(**attrs)),
         ):
-            with pytest.raises(RegistryError, match="update_default_scopes"):
+            with pytest.raises(RegistryError, match=missing):
                 MultiTenantOCIAuth(reg, base_url=HOST)
 
 

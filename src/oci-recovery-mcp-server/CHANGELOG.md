@@ -73,6 +73,20 @@ itself, which removes four local settings and requires one new one.
   told is supported and the proxy refuses an authorize request carrying anything
   else. Startup fails loudly if a future FastMCP release drops the method this
   relies on.
+- **Sign-in still failed with `invalid_scope` for clients that omit `scope`.**
+  Qualifying the scopes a client is *told* about only helps a client that asks
+  for them. `/authorize` may arrive with no `scope` parameter at all, and the
+  proxy then falls back to its own `required_scopes` — which stayed bare, so the
+  upstream request carried an unqualified resource scope and IDCS rejected it.
+  A third path had the same gap: the refresh request is built from the scopes
+  stored on the refresh token, and those were parsed bare out of the IDCS token
+  response, so a session would have died at its first refresh an hour after a
+  sign-in that looked completely successful. Both fallbacks are now qualified
+  with the tenancy's audience, alongside the advertised scopes. Verification is
+  unaffected — it compares against the token verifier's own bare scopes — and
+  startup now refuses any provider that verifies the id_token, since that mode
+  makes `required_scopes` the enforcement point as well and the two uses need
+  opposite forms.
 - **OAuth discovery required a header no client can send there.** Protected-resource
   metadata is fetched before any MCP session exists, and `X-OCI-Tenancy` rides only
   on requests to the MCP URL itself, so discovery always arrived without it and was

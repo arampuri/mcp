@@ -21,11 +21,11 @@ The server exposes 24 MCP tools. It does not create, update, or delete OCI resou
 
 ## Install and run locally
 
-From the repository root:
+From this project directory (`src/oci-recovery-mcp-server`), `uv` resolves and installs
+the dependencies into a project virtual environment on first run:
 
 ```sh
-uv venv --python 3.13 .venv
-uv pip install --python .venv/bin/python -e .
+uv sync
 ```
 
 Choose an authentication method. Configuration comes from environment variables, which
@@ -45,22 +45,29 @@ oci session authenticate --profile-name DEFAULT
 For API-key authentication, use `ORACLE_MCP_AUTH_METHOD=apikey`; the selected OCI profile must contain the normal API-key fields. The `session` and `apikey` methods run over stdio only:
 
 ```sh
-.venv/bin/oracle.oci-recovery-mcp-server
+uv run oracle.oci-recovery-mcp-server
 ```
 
 The server loads `.env` from the working directory or a parent directory. Set `ORACLE_MCP_ENV_FILE` to use a specific configuration file; explicitly exported variables take precedence.
 
-### Local MCP client configuration
+### Local MCP client configuration (from source)
 
-Configure an MCP client to start the installed entry point. For example:
+Configure an MCP client to start the server with `uv`. `--directory` points at this
+project so `uv` uses its lockfile and `.env`, and works regardless of the client's own
+working directory:
 
 ```json
 {
   "mcpServers": {
     "oci-recovery-local": {
       "type": "stdio",
-      "command": "/ABS/PATH/oci-recovery-mcp-server/.venv/bin/oracle.oci-recovery-mcp-server",
-      "cwd": "/ABS/PATH/oci-recovery-mcp-server",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABS/PATH/mcp/src/oci-recovery-mcp-server",
+        "run",
+        "oracle.oci-recovery-mcp-server"
+      ],
       "env": {
         "ORACLE_MCP_AUTH_METHOD": "session",
         "ORACLE_MCP_AUTH_PROFILE": "DEFAULT"
@@ -69,6 +76,52 @@ Configure an MCP client to start the installed entry point. For example:
   }
 }
 ```
+
+If `uv` is not on the MCP client's `PATH` (common for GUI clients that do not load your
+shell profile), use its absolute path — `which uv` — as `command`.
+
+### Local MCP client configuration (published PyPI package)
+
+The server is published as
+[`oracle.oci-recovery-mcp-server`](https://pypi.org/project/oracle.oci-recovery-mcp-server/).
+No clone or checkout is needed: `uvx` downloads the package into a cached, isolated
+environment and runs its entry point.
+
+```sh
+uvx oracle.oci-recovery-mcp-server
+```
+
+To pin a version, use `uvx oracle.oci-recovery-mcp-server@3.1.0`.
+
+```json
+{
+  "mcpServers": {
+    "oci-recovery": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["oracle.oci-recovery-mcp-server"],
+      "env": {
+        "ORACLE_MCP_AUTH_METHOD": "session",
+        "ORACLE_MCP_AUTH_PROFILE": "DEFAULT"
+      }
+    }
+  }
+}
+```
+
+`uvx` runs from the client's working directory, which may not be where your `.env` lives.
+Either set the variables in the `env` block above, as shown, or point
+`ORACLE_MCP_ENV_FILE` at an absolute path.
+
+Installing the package into a persistent tool environment instead of the `uvx` cache also
+works:
+
+```sh
+uv tool install oracle.oci-recovery-mcp-server
+```
+
+That puts `oracle.oci-recovery-mcp-server` on `PATH`, which can then be used directly as
+the client's `command`.
 
 `session` and `apikey` mode cannot be served over a network listener: they carry the
 operator's own OCI credentials and have no per-caller authentication. Setting
@@ -92,14 +145,15 @@ not match the domain's configuration makes every sign-in for that tenancy fail.
 
 The default `ORACLE_MCP_OAUTH_SCOPES` includes `oci_mcp.recovery.invoke`, which gates access to this server's Recovery tools beyond a bare authenticated identity. If you override `ORACLE_MCP_OAUTH_SCOPES`, keep `oci_mcp.recovery.invoke` in the list.
 
-Write resource scopes **bare**, never qualified with the audience. IAM names a resource
-application's scopes by concatenating its primary audience with the scope name, and
-`/authorize` accepts only that form — but the access token it issues carries the scope
-bare, and that token is re-validated on every request against this same setting. The
-server reconciles the two: it verifies against the configured value and qualifies each
-tenancy's resource scopes with that tenancy's own audience before advertising them to
-clients. Qualifying them yourself produces `401 invalid_token` on the first tool call,
-after a sign-in that appeared to succeed.
+Write those scopes **bare**, not qualified with the audience. IDCS recognizes a resource
+scope at `/authorize` only in its fully-qualified form — the audience and the scope name
+concatenated without a separator — but returns it bare in the access token it issues, and
+that token is re-validated against this setting on every request. The server handles both
+forms for you: it keeps the configured value for verification and qualifies each tenancy's
+resource scopes with that tenancy's own audience on every path that reaches IDCS — the
+scopes advertised to clients, the fallback used when a client sends no `scope` at all, and
+token refresh. Qualifying them yourself makes every tool call fail with
+`401 invalid_token`.
 
 The registry is a TOML file with one table per tenancy. The table name is the URL-safe
 tenancy name (letters, digits, `-`, `_`) used both in the `X-OCI-Tenancy` header and in
