@@ -9,7 +9,7 @@ An Oracle Cloud Infrastructure (OCI) Model Context Protocol (MCP) server for rea
 - Query Recovery Service metrics, service limits, and tenancy region subscriptions.
 - Aggregate supported list and summary operations across a compartment subtree.
 - Provide non-destructive Recovery Service dashboard and Cloud Protect onboarding guidance.
-- Run locally with OCI API-key or session-token authentication, or as a hosted multi-tenant OAuth service.
+- Run locally with OCI API-key or session-token authentication, or as a hosted single-tenant or multi-tenant HTTP OAuth service.
 
 The server exposes 24 MCP tools. It does not create, update, or delete OCI resources.
 
@@ -126,24 +126,59 @@ the client's `command`.
 `session` and `apikey` mode cannot be served over a network listener: they carry the
 operator's own OCI credentials and have no per-caller authentication. Setting
 `ORACLE_MCP_HOST` and `ORACLE_MCP_PORT` in these modes fails startup; both variables are
-reserved for `oauth` mode. To expose this server over HTTP, use the hosted OAuth
-deployment below.
+reserved for `oauth` mode. To expose this server over HTTP, see
+[HTTP (Streamable HTTP) deployment](#http-streamable-http-deployment) below.
 
-## Hosted multi-tenant OAuth
+## HTTP (Streamable HTTP) deployment
 
-OAuth mode runs one Streamable HTTP server for one or more tenancies. Each client sends `X-OCI-Tenancy` with the configured tenancy alias (or tenancy OCID) to select the correct sign-in and OCI request routing context. The tenancy registry, OAuth client secrets, signing keys, and OAuth state remain server-side.
+Serving this server over HTTP requires `ORACLE_MCP_AUTH_METHOD=oauth`. The `session` and
+`apikey` methods carry the operator's own OCI credentials and have no per-caller
+authentication, so they run over stdio only; setting `ORACLE_MCP_HOST`/`ORACLE_MCP_PORT`
+in those modes fails startup.
 
-Set `ORACLE_MCP_AUTH_METHOD=oauth` and configure `ORACLE_MCP_TENANCY_REGISTRY`. Each registry entry supplies a tenancy OCID, IAM domain, confidential-client credentials, resource audience, and OCI region. The supported single-tenant fallback is the legacy `ORACLE_MCP_IDCS_DOMAIN`, `ORACLE_MCP_IDCS_CLIENT_ID`, `ORACLE_MCP_IDCS_CLIENT_SECRET`, `ORACLE_MCP_IDCS_AUDIENCE`, `ORACLE_MCP_TENANCY_ID`, and `ORACLE_MCP_REGION` variables.
+In OAuth mode each caller signs in to an OCI IAM (IDCS) domain, and the server exchanges
+that caller's access token for caller-specific OCI credentials. Tenancy configuration,
+OAuth client secrets, signing keys, and OAuth state all remain server-side.
 
-When registering the IAM domain integrated application for a tenancy, configure a
-**primary audience** on its resource application and put that exact value in the
-entry's `audience`. It is both the `aud` claim issued access tokens are verified
-against and the audience requested at `/authorize` and `/token`, so a value that does
-not match the domain's configuration makes every sign-in for that tenancy fail.
+One process can serve **one tenancy** or **many**. The mechanism is the same in both
+cases — the server always builds an internal tenancy registry, keyed by a URL-safe
+tenancy alias — the two setups differ only in how that registry is supplied and whether
+clients must name their tenancy:
 
-`ORACLE_MCP_BASE_URL` is required and must be an absolute `https://` URL: this is what per-tenancy authorize/callback/well-known URLs are built from, so a missing or plain-HTTP value fails startup rather than silently advertising `http://localhost:8000`. Set `ORACLE_MCP_OAUTH_ALLOW_INSECURE_LOCAL=true` to allow an `http://localhost` base URL for local development only.
+| | Single-tenant | Multi-tenant |
+| --- | --- | --- |
+| Configuration | Env vars, or a registry file with one table | Registry file with one table per tenancy |
+| IAM domains / OAuth apps | One | One per tenancy |
+| `X-OCI-Tenancy` client header | Optional | Required |
+| MCP URL | `https://MCP_HOST/mcp` | `https://MCP_HOST/mcp` (same URL for all tenancies) |
+| OAuth callback | `<base_url>/t/<alias>/auth/callback` | `<base_url>/t/<alias>/auth/callback`, per tenancy |
 
-The default `ORACLE_MCP_OAUTH_SCOPES` includes `oci_mcp.recovery.invoke`, which gates access to this server's Recovery tools beyond a bare authenticated identity. If you override `ORACLE_MCP_OAUTH_SCOPES`, keep `oci_mcp.recovery.invoke` in the list.
+### Common prerequisites (both modes)
+
+For each tenancy you serve, create in its OCI IAM domain:
+
+1. A **resource application** with a **primary audience** and a scope named
+   `oci_mcp.recovery.invoke`.
+2. A **confidential application** (client ID + secret) authorized for that resource
+   application, with `<base_url>/t/<alias>/auth/callback` registered as a redirect URI.
+   `<alias>` is the tenancy alias described below.
+
+The primary audience is both the `aud` claim that issued access tokens are verified
+against and the audience requested at `/authorize` and `/token`, so a value that does not
+match the domain's configuration makes every sign-in for that tenancy fail.
+
+`ORACLE_MCP_BASE_URL` is required and must be an absolute `https://` URL: authorize,
+callback, and well-known URLs are built from it, so a missing or plain-HTTP value fails
+startup rather than silently advertising `http://localhost:8000`. Set
+`ORACLE_MCP_OAUTH_ALLOW_INSECURE_LOCAL=true` to allow an `http://localhost` base URL for
+local development only.
+
+Run the HTTP listener behind a TLS-terminating reverse proxy and bind it to `127.0.0.1`
+(the default). `ORACLE_MCP_BASE_URL` must be the public `https://` URL clients reach.
+
+The default `ORACLE_MCP_OAUTH_SCOPES` includes `oci_mcp.recovery.invoke`, which gates
+access to this server's Recovery tools beyond a bare authenticated identity. If you
+override `ORACLE_MCP_OAUTH_SCOPES`, keep `oci_mcp.recovery.invoke` in the list.
 
 Write those scopes **bare**, not qualified with the audience. IDCS recognizes a resource
 scope at `/authorize` only in its fully-qualified form — the audience and the scope name
@@ -155,10 +190,72 @@ scopes advertised to clients, the fallback used when a client sends no `scope` a
 token refresh. Qualifying them yourself makes every tool call fail with
 `401 invalid_token`.
 
-The registry is a TOML file with one table per tenancy. The table name is the URL-safe
-tenancy name (letters, digits, `-`, `_`) used both in the `X-OCI-Tenancy` header and in
-the per-tenancy OAuth callback path `<base_url>/t/TENANCY_NAME/auth/callback`, which must
-be registered as a redirect URI on the corresponding IAM confidential application.
+### Single-tenant HTTP server
+
+Use this when the server front-ends exactly one tenancy. Clients need no custom header:
+with one tenancy configured there is nothing to disambiguate, so OAuth discovery is
+answered for it.
+
+The simplest configuration is environment variables only — no registry file:
+
+```dotenv
+ORACLE_MCP_AUTH_METHOD=oauth
+ORACLE_MCP_BASE_URL=https://MCP_HOST
+ORACLE_MCP_HOST=127.0.0.1
+ORACLE_MCP_PORT=8000
+
+ORACLE_MCP_TENANCY_ID=ocid1.tenancy.oc1..aaaa
+ORACLE_MCP_REGION=us-ashburn-1
+ORACLE_MCP_IDCS_DOMAIN=idcs-aaaa.identity.oraclecloud.com
+ORACLE_MCP_IDCS_CLIENT_ID=REPLACE_ME
+ORACLE_MCP_IDCS_CLIENT_SECRET=REPLACE_ME
+ORACLE_MCP_IDCS_AUDIENCE=REPLACE_ME
+# Optional; defaults to "default". Used in the OAuth callback path.
+ORACLE_MCP_TENANCY_ALIAS=default
+```
+
+All six of `ORACLE_MCP_TENANCY_ID`, `ORACLE_MCP_REGION`, `ORACLE_MCP_IDCS_DOMAIN`,
+`ORACLE_MCP_IDCS_CLIENT_ID`, `ORACLE_MCP_IDCS_CLIENT_SECRET`, and
+`ORACLE_MCP_IDCS_AUDIENCE` must be present; the server synthesizes a one-entry registry
+from them and fails startup with an actionable message if any is missing. The redirect
+URI to register on the confidential application is
+`<base_url>/t/<ORACLE_MCP_TENANCY_ALIAS>/auth/callback` — with the default alias, that is
+`https://MCP_HOST/t/default/auth/callback`.
+
+Start it:
+
+```sh
+uv run oracle.oci-recovery-mcp-server
+```
+
+Client configuration needs only the URL:
+
+```json
+{
+  "mcpServers": {
+    "oci-recovery": {
+      "type": "streamableHttp",
+      "url": "https://MCP_HOST/mcp"
+    }
+  }
+}
+```
+
+A single-tenant deployment can equally use a one-table registry file (next section);
+setting `ORACLE_MCP_TENANCY_REGISTRY` takes precedence over these environment variables
+and makes a later move to multi-tenant a matter of appending tables.
+
+### Multi-tenant HTTP server
+
+Use this when one process serves several tenancies behind one MCP URL. Each tenancy keeps
+its own IAM domain, OAuth application, and secrets, and clients select their tenancy with
+the `X-OCI-Tenancy` header (tenancy alias or tenancy OCID).
+
+Point `ORACLE_MCP_TENANCY_REGISTRY` at a server-side TOML file with one table per
+tenancy. The table name is the tenancy alias: it must be URL-safe (letters, digits, `-`,
+`_`), and it appears both in the `X-OCI-Tenancy` header and in that tenancy's OAuth
+callback path `<base_url>/t/ALIAS/auth/callback`, which must be registered as a redirect
+URI on the corresponding IAM confidential application.
 
 ```toml
 [TENANCY_NAME]
@@ -168,41 +265,37 @@ client_id     = "REPLACE_ME"
 client_secret = "REPLACE_ME"
 audience      = "REPLACE_ME"                           # resource app primary audience
 region        = "us-ashburn-1"
+
+[ANOTHER_TENANCY]
+tenancy_id    = "ocid1.tenancy.oc1..bbbb"
+idcs_domain   = "idcs-bbbb.identity.oraclecloud.com"
+client_id     = "REPLACE_ME"
+client_secret = "REPLACE_ME"
+audience      = "REPLACE_ME"
+region        = "eu-frankfurt-1"
 ```
+
+Every field is required for every tenancy, `audience` is never defaulted from another
+tenancy's value, and two tables may not share a `tenancy_id`. The alias `_select` is
+reserved.
 
 This file holds OAuth client secrets and must never be committed or served. Restrict it
 to the service user (mode `640`).
 
-Per-tenancy OAuth state (client registrations and authorization state) is persisted and
-encrypted at rest by FastMCP under its home directory, `~/.fastmcp/oauth-proxy/` by
-default and relocatable with `FASTMCP_HOME`. The storage directory and the token-signing
-key are both derived from each tenancy's `client_secret`, so tenancies stay isolated from
-one another and keys survive restarts and multiple workers without being stored in the
-registry. Treat that directory as secret material, exclude it from images, and give it
-persistent storage in a container deployment — a fresh directory on every restart forces
-all clients to re-register. Rotating a tenancy's `client_secret` invalidates its
-already-issued tokens, and its clients sign in again.
+```dotenv
+ORACLE_MCP_AUTH_METHOD=oauth
+ORACLE_MCP_BASE_URL=https://MCP_HOST
+ORACLE_MCP_HOST=127.0.0.1
+ORACLE_MCP_PORT=8000
+ORACLE_MCP_TENANCY_REGISTRY=/etc/oci-recovery-mcp/tenancies.toml
+```
 
-The first authorization for a tenancy shows a consent screen; subsequent tool calls reuse
-the granted session.
+```sh
+uv run oracle.oci-recovery-mcp-server
+```
 
-Clients register through Dynamic Client Registration at `/t/TENANCY_NAME/register`, an
-exchange that never leaves the host, so authentication needs no outbound internet access.
-CIMD (Client ID Metadata Document) registration is deliberately disabled: it would let a
-client present an HTTPS URL as its `client_id` and require this server to fetch that URL,
-which fails on a network-restricted host and surfaces as `The client ID ... was not found
-in the server's client registry`.
-
-OAuth discovery cannot carry `X-OCI-Tenancy` — a client fetches the well-known metadata
-before it has an MCP session, and that header rides only on requests to the MCP URL. When
-exactly one tenancy is configured there is nothing to disambiguate, so discovery is
-answered for it. A multi-tenancy registry still requires the header, and therefore a
-client able to send it.
-
-Run the HTTP listener behind a TLS-terminating reverse proxy and bind it to
-`127.0.0.1`. `ORACLE_MCP_BASE_URL` must be the public `https://` URL clients reach.
-
-After deployment, a remote client configuration has this form:
+Every tenancy is reached at the same MCP URL; the header selects the sign-in and OCI
+request-routing context:
 
 ```json
 {
@@ -217,6 +310,43 @@ After deployment, a remote client configuration has this form:
   }
 }
 ```
+
+The header is mandatory here. OAuth discovery cannot carry `X-OCI-Tenancy` in every
+client — the well-known metadata is fetched before there is an MCP session, and the
+header rides only on requests to the MCP URL — so a multi-tenancy registry requires a
+client able to send it; without a usable value the discovery endpoint returns a `400
+tenancy_required` listing the valid aliases. `GET https://MCP_HOST/tenancies` serves a
+plain page listing the configured aliases (no secrets) for users configuring a client.
+
+Token verification never trusts the header: each tenancy's verifier is tried and the one
+whose signing key matches wins, and the verified token is stamped with the tenancy it
+proved, so tool routing is bound to the proven identity rather than a mutable request
+header.
+
+### Operational notes (both modes)
+
+Per-tenancy OAuth state (client registrations and authorization state) is persisted and
+encrypted at rest by FastMCP under its home directory, `~/.fastmcp/oauth-proxy/` by
+default and relocatable with `FASTMCP_HOME`. The storage directory and the token-signing
+key are both derived from each tenancy's client secret, so tenancies stay isolated from
+one another and keys survive restarts and multiple workers without being stored in the
+registry. Treat that directory as secret material, exclude it from images, and give it
+persistent storage in a container deployment — a fresh directory on every restart forces
+all clients to re-register. Rotating a tenancy's client secret invalidates its
+already-issued tokens, and its clients sign in again.
+
+The first authorization for a tenancy shows a consent screen; subsequent tool calls reuse
+the granted session.
+
+Clients register through Dynamic Client Registration at `/t/ALIAS/register`, an exchange
+that never leaves the host, so authentication needs no outbound internet access. CIMD
+(Client ID Metadata Document) registration is deliberately disabled: it would let a client
+present an HTTPS URL as its `client_id` and require this server to fetch that URL, which
+fails on a network-restricted host and surfaces as `The client ID ... was not found in the
+server's client registry`.
+
+Keep client secrets out of source control; supply them from a secret manager or the
+deployment environment.
 
 For a VPN-only deployment whose proxy uses an internal CA, clients must trust that CA's
 public root certificate. Distribute only the public root certificate, never the private key.
