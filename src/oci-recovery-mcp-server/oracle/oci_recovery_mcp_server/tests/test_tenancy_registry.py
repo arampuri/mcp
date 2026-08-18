@@ -6,6 +6,7 @@ https://oss.oracle.com/licenses/upl.
 
 import textwrap
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -30,6 +31,7 @@ _GOOD = """
     idcs_domain   = "idcs-aaaa.identity.oraclecloud.com"
     client_id     = "client-one"
     client_secret = "secret-one"
+    audience      = "https://recovery.t1.example.com"
     region        = "us-ashburn-1"
 
     [t2]
@@ -37,8 +39,8 @@ _GOOD = """
     idcs_domain   = "idcs-bbbb.identity.oraclecloud.com"
     client_id     = "client-two"
     client_secret = "secret-two"
+    audience      = "https://recovery.t2.example.com"
     region        = "us-phoenix-1"
-    jwt_signing_key = "deadbeef"
 """
 
 
@@ -54,7 +56,7 @@ class TestTenancyRegistry:
 
         by_ocid = reg.lookup("ocid1.tenancy.oc1..bbbb")
         assert by_ocid.alias == "t2"
-        assert by_ocid.jwt_signing_key == "deadbeef"
+        assert by_ocid.audience == "https://recovery.t2.example.com"
 
         assert reg.lookup("nope") is None
         assert reg.lookup(None) is None
@@ -75,9 +77,40 @@ class TestTenancyRegistry:
             tenancy_id  = "ocid1.tenancy.oc1..aaaa"
             idcs_domain = "idcs-aaaa.identity.oraclecloud.com"
             client_id   = "cid1"
+            audience    = "https://recovery.t1.example.com"
             region      = "us-ashburn-1"
         """
         with pytest.raises(RegistryError, match="client_secret"):
+            TenancyRegistry.from_file(_write(tmp_path, body))
+
+    def test_missing_audience_raises(self, tmp_path):
+        # The IAM resource audience is per tenancy and is what issued tokens are
+        # verified against, so it must never be defaulted or inherited.
+        body = """
+            [t1]
+            tenancy_id    = "ocid1.tenancy.oc1..aaaa"
+            idcs_domain   = "idcs-aaaa.identity.oraclecloud.com"
+            client_id     = "cid1"
+            client_secret = "sec1"
+            region        = "us-ashburn-1"
+        """
+        with pytest.raises(RegistryError, match="audience"):
+            TenancyRegistry.from_file(_write(tmp_path, body))
+
+    def test_removed_signing_key_field_is_rejected_not_ignored(self, tmp_path):
+        # Silently dropping it would leave an operator believing a key they pinned
+        # is in use. FastMCP now derives it from client_secret.
+        body = """
+            [t1]
+            tenancy_id      = "ocid1.tenancy.oc1..aaaa"
+            idcs_domain     = "idcs-aaaa.identity.oraclecloud.com"
+            client_id       = "cid1"
+            client_secret   = "sec1"
+            audience        = "https://recovery.t1.example.com"
+            region          = "us-ashburn-1"
+            jwt_signing_key = "deadbeef"
+        """
+        with pytest.raises(RegistryError, match="jwt_signing_key"):
             TenancyRegistry.from_file(_write(tmp_path, body))
 
     def test_duplicate_tenancy_id_raises(self, tmp_path):
@@ -87,6 +120,7 @@ class TestTenancyRegistry:
             idcs_domain   = "idcs-aaaa.identity.oraclecloud.com"
             client_id     = "cid1"
             client_secret = "sec1"
+            audience      = "https://recovery.t1.example.com"
             region        = "us-ashburn-1"
 
             [t2]
@@ -94,6 +128,7 @@ class TestTenancyRegistry:
             idcs_domain   = "idcs-bbbb.identity.oraclecloud.com"
             client_id     = "cid2"
             client_secret = "sec2"
+            audience      = "https://recovery.t2.example.com"
             region        = "us-phoenix-1"
         """
         with pytest.raises(RegistryError, match="Duplicate tenancy_id"):
@@ -106,6 +141,7 @@ class TestTenancyRegistry:
             idcs_domain   = "idcs-aaaa.identity.oraclecloud.com"
             client_id     = "cid1"
             client_secret = "sec1"
+            audience      = "https://recovery.t1.example.com"
             region        = "us-ashburn-1"
         """
         with pytest.raises(RegistryError, match="reserved"):
@@ -118,6 +154,7 @@ class TestTenancyRegistry:
             idcs_domain   = "idcs-aaaa.identity.oraclecloud.com"
             client_id     = "cid1"
             client_secret = "sec1"
+            audience      = "https://recovery.t1.example.com"
             region        = "us-ashburn-1"
         """
         with pytest.raises(RegistryError, match="URL-safe"):
@@ -134,6 +171,7 @@ class TestTenancyRegistry:
             idcs_domain   = "http://idcs-aaaa.identity.oraclecloud.com"
             client_id     = "client-one"
             client_secret = "secret-one"
+            audience      = "https://recovery.t1.example.com"
             region        = "us-ashburn-1"
         """
         with pytest.raises(RegistryError, match="https"):
@@ -160,10 +198,10 @@ class TestTenancyRegistry:
             "ORACLE_MCP_IDCS_DOMAIN": "idcs.example.com",
             "ORACLE_MCP_IDCS_CLIENT_ID": "client-id",
             "ORACLE_MCP_IDCS_CLIENT_SECRET": "client-secret",
+            "ORACLE_MCP_IDCS_AUDIENCE": "https://recovery.example.com",
             "ORACLE_MCP_TENANCY_ID": "ocid1.tenancy.oc1..example",
             "ORACLE_MCP_REGION": "us-ashburn-1",
             "ORACLE_MCP_TENANCY_ALIAS": "example",
-            "ORACLE_MCP_JWT_SIGNING_KEY": "key-material",
         }.items():
             monkeypatch.setenv(name, value)
         monkeypatch.delenv("ORACLE_MCP_TENANCY_REGISTRY", raising=False)
@@ -171,8 +209,25 @@ class TestTenancyRegistry:
 
         registry = server._get_registry()
         assert registry.lookup("example").tenancy_id == "ocid1.tenancy.oc1..example"
-        assert registry.lookup("example").jwt_signing_key == "key-material"
+        assert registry.lookup("example").audience == "https://recovery.example.com"
         assert server._get_registry() is registry
+        server._reset_registry_cache()
+
+    def test_legacy_environment_registry_requires_audience(self, monkeypatch):
+        for name, value in {
+            "ORACLE_MCP_IDCS_DOMAIN": "idcs.example.com",
+            "ORACLE_MCP_IDCS_CLIENT_ID": "client-id",
+            "ORACLE_MCP_IDCS_CLIENT_SECRET": "client-secret",
+            "ORACLE_MCP_TENANCY_ID": "ocid1.tenancy.oc1..example",
+            "ORACLE_MCP_REGION": "us-ashburn-1",
+        }.items():
+            monkeypatch.setenv(name, value)
+        for name in ("ORACLE_MCP_TENANCY_REGISTRY", "ORACLE_MCP_IDCS_AUDIENCE", "IDCS_AUDIENCE"):
+            monkeypatch.delenv(name, raising=False)
+        server._reset_registry_cache()
+
+        with pytest.raises(RegistryError, match="ORACLE_MCP_IDCS_AUDIENCE"):
+            server._get_registry()
         server._reset_registry_cache()
 
     def test_main_selects_oauth_http_and_stdio_transports(self, monkeypatch):
@@ -202,9 +257,12 @@ class TestTenancyRegistry:
             "ORACLE_MCP_IDCS_DOMAIN": "idcs.example.com",
             "ORACLE_MCP_IDCS_CLIENT_ID": "client-id",
             "ORACLE_MCP_IDCS_CLIENT_SECRET": "client-secret",
+            "ORACLE_MCP_IDCS_AUDIENCE": "https://recovery.example.com",
             "ORACLE_MCP_TENANCY_ID": "ocid1.tenancy.oc1..example",
             "ORACLE_MCP_REGION": "us-ashburn-1",
             "ORACLE_MCP_TENANCY_ALIAS": "example",
+            "ORACLE_MCP_BASE_URL": "https://mcp.example.com",
+            "ORACLE_MCP_AUTH_METHOD": "oauth",
         }.items():
             monkeypatch.setenv(name, value)
         monkeypatch.delenv("ORACLE_MCP_TENANCY_REGISTRY", raising=False)
@@ -218,10 +276,15 @@ class TestTenancyRegistry:
         import oci.auth.signers
 
         monkeypatch.setattr(dependencies, "get_access_token", lambda: token)
+        # Stub only the provider the shared builder constructs (it imports the class
+        # into its own namespace); build_idcs_http_auth and the credential handling
+        # it returns -- IDCSHttpAuth.context_for -- both run for real.
+        with patch("oracle_mcp_common.auth.OCIProvider"):
+            monkeypatch.setattr(server.mcp, "auth", server._build_auth_provider(), raising=False)
 
         class FakeTokenExchangeSigner:
-            def __init__(self, jwt_or_func, client_id, client_secret, oci_domain_url):
-                self.values = (jwt_or_func, client_id, client_secret, oci_domain_url)
+            def __init__(self, jwt_or_func, oci_domain_url, client_id, client_secret, region=None):
+                self.values = (jwt_or_func, oci_domain_url, client_id, client_secret, region)
 
         monkeypatch.setattr(oci.auth.signers, "TokenExchangeSigner", FakeTokenExchangeSigner)
 
@@ -230,11 +293,24 @@ class TestTenancyRegistry:
         oauth_config = server._oauth_base_config(entry)
         assert oauth_config["region"] == "us-ashburn-1"
         assert oauth_config["additional_user_agent"] == f"oci-recovery-mcp/{server.__version__}"
-        signer = server._build_token_exchange_signer(entry)
-        assert signer.values == ("access-token", "client-id", "client-secret", "https://idcs.example.com")
-        # No process-wide cache: a second call for the same tenancy + token builds
-        # a distinct signer instead of reusing state outside the request context.
-        assert server._build_token_exchange_signer(entry) is not signer
+
+        auth_context = server._request_auth_context(entry, oauth_config["region"])
+        assert auth_context.config == {"region": "us-ashburn-1"}
+        assert auth_context.signer.values == (
+            "access-token",
+            "https://idcs.example.com",
+            "client-id",
+            "client-secret",
+            "us-ashburn-1",
+        )
+        # The tenancy's shared IDCS auth policy is built once...
+        assert server._tenancy_http_auth(entry) is server._tenancy_http_auth(entry)
+        # ...but no signer is cached: a second call for the same tenancy + token
+        # builds a distinct signer instead of reusing state outside the request.
+        assert (
+            server._request_auth_context(entry, oauth_config["region"]).signer
+            is not auth_context.signer
+        )
         server._reset_registry_cache()
 
     def test_client_factory_uses_oracle_mcp_common_for_api_key_and_session_authentication(

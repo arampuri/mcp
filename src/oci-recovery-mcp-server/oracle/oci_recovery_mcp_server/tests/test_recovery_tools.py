@@ -292,6 +292,7 @@ def _oauth_entry(alias="t1", tenancy_id="ocid1.tenancy.oc1..t", region="us-ashbu
         idcs_domain="idcs-abc.identity.oraclecloud.com",
         client_id="cid",
         client_secret="csec",
+        audience=f"https://recovery.{alias}.example.com",
         region=region,
     )
 
@@ -312,24 +313,13 @@ class TestOAuthMode:
         monkeypatch.delenv("ORACLE_MCP_AUTH_METHOD", raising=False)
         assert server._effective_auth_method() == "session"
 
-    def test_domain_to_url_normalizes_host_or_url(self):
-        from oracle.oci_recovery_mcp_server.multitenant_auth import _domain_to_url
-
-        assert _domain_to_url("idcs-abc.identity.oraclecloud.com") == "https://idcs-abc.identity.oraclecloud.com"
-        assert _domain_to_url("https://idcs-abc.identity.oraclecloud.com/") == "https://idcs-abc.identity.oraclecloud.com"
-
-    def test_domain_to_url_rejects_http(self):
-        from oracle.oci_recovery_mcp_server.multitenant_auth import _domain_to_url
-
-        with pytest.raises(ValueError, match="https"):
-            _domain_to_url("http://idcs-abc.identity.oraclecloud.com")
-
     def test_legacy_env_synthesizes_single_tenant_registry(self, monkeypatch):
         monkeypatch.setenv("ORACLE_MCP_AUTH_METHOD", "oauth")
         monkeypatch.delenv("ORACLE_MCP_TENANCY_REGISTRY", raising=False)
         monkeypatch.setenv("ORACLE_MCP_IDCS_DOMAIN", "idcs-abc.identity.oraclecloud.com")
         monkeypatch.setenv("ORACLE_MCP_IDCS_CLIENT_ID", "cid")
         monkeypatch.setenv("ORACLE_MCP_IDCS_CLIENT_SECRET", "csec")
+        monkeypatch.setenv("ORACLE_MCP_IDCS_AUDIENCE", "https://recovery.example.com")
         monkeypatch.setenv("ORACLE_MCP_TENANCY_ID", "ocid1.tenancy.oc1..t")
         monkeypatch.setenv("ORACLE_MCP_REGION", "us-ashburn-1")
         monkeypatch.setenv("ORACLE_MCP_TENANCY_ALIAS", "acme")
@@ -355,20 +345,22 @@ class TestOAuthMode:
         side_effect=lambda client, **_: client,
     )
     @patch("oracle.oci_recovery_mcp_server.server.oci.recovery.DatabaseRecoveryClient")
-    @patch("oracle.oci_recovery_mcp_server.server._build_token_exchange_signer")
+    @patch("oracle.oci_recovery_mcp_server.server._request_auth_context")
     @patch("oracle.oci_recovery_mcp_server.server._current_tenancy")
     @patch("oracle.oci_recovery_mcp_server.server._effective_auth_method", return_value="oauth")
-    def test_make_client_oauth_uses_token_exchange_signer(
+    def test_make_client_oauth_uses_shared_idcs_request_context(
         self,
         _mock_auth,
         mock_current,
-        mock_build_signer,
+        mock_auth_context,
         mock_client,
         _mock_wrap,
     ):
         mock_current.return_value = _oauth_entry()
         signer = object()
-        mock_build_signer.return_value = signer
+        mock_auth_context.return_value = SimpleNamespace(
+            config={"region": "us-phoenix-1"}, signer=signer
+        )
 
         result = server.get_recovery_client(region="us-phoenix-1", request_id="rid")
 
@@ -376,66 +368,134 @@ class TestOAuthMode:
         assert args[0]["region"] == "us-phoenix-1"
         assert kwargs["signer"] is signer
         # the signer is built for the token's tenancy, not a request header
-        mock_build_signer.assert_called_once_with(mock_current.return_value)
+        mock_auth_context.assert_called_once_with(mock_current.return_value, "us-phoenix-1")
         assert result is mock_client.return_value
 
-    def test_token_exchange_signer_is_never_reused_across_calls(self, monkeypatch):
-        # No process-wide cache: every call builds a fresh signer scoped to the
-        # request that established the caller's identity, even for the same
-        # tenancy and the same token jti.
+    def test_request_signer_is_never_reused_across_calls(self, monkeypatch):
+        # No process-wide signer cache: every call asks oracle-mcp-common's
+        # context_for() for a signer scoped to the request that established the
+        # caller's identity, even for the same tenancy and the same token jti.
+        # Only the per-tenancy policy (provider + server-side credentials) is
+        # long-lived, and it is created once at startup.
+        from oracle.oci_recovery_mcp_server.multitenant_auth import MultiTenantOCIAuth
+        from oracle.oci_recovery_mcp_server.tenancy_registry import TenancyRegistry
+
         made = []
 
         class FakeTES:
-            def __init__(self, **kwargs):
-                made.append(kwargs)
+            def __init__(self, *args, **kwargs):
+                made.append((args, kwargs))
+
+        t1 = _oauth_entry(alias="t1", tenancy_id="ocid1.tenancy.oc1..t1")
+        t2 = _oauth_entry(alias="t2", tenancy_id="ocid1.tenancy.oc1..t2")
+        with patch("oracle_mcp_common.auth.OCIProvider"):
+            auth = MultiTenantOCIAuth(
+                TenancyRegistry([t1, t2]),
+                base_url="https://mcp.example.com",
+            )
+        monkeypatch.setattr(server.mcp, "auth", auth, raising=False)
 
         access = SimpleNamespace(token="tok", claims={"jti": "shared-jti"})
         monkeypatch.setattr(
             "fastmcp.server.dependencies.get_access_token", lambda: access, raising=False
         )
         with patch("oci.auth.signers.TokenExchangeSigner", FakeTES):
-            s1 = server._build_token_exchange_signer(_oauth_entry(alias="t1"))
-            s2 = server._build_token_exchange_signer(_oauth_entry(alias="t2"))
-            s1b = server._build_token_exchange_signer(_oauth_entry(alias="t1"))
+            s1 = server._request_auth_context(t1).signer
+            s2 = server._request_auth_context(t2).signer
+            s1b = server._request_auth_context(t1).signer
 
         assert s1 is not s2  # different tenancy -> different signer
         assert s1 is not s1b  # same tenancy + jti -> still a new signer, no cache
         assert len(made) == 3
         assert not hasattr(server, "_oauth_signer_cache")
+        # the exchange runs on the tenancy's own credentials, via the shared library
+        assert made[0][0] == ("tok", "https://idcs-abc.identity.oraclecloud.com", "cid", "csec")
+
+    def test_request_auth_context_requires_a_configured_tenancy_policy(self, monkeypatch):
+        access = SimpleNamespace(token="tok", claims={})
+        monkeypatch.setattr(
+            "fastmcp.server.dependencies.get_access_token", lambda: access, raising=False
+        )
+        monkeypatch.setattr(server.mcp, "auth", None, raising=False)
+        with pytest.raises(ValueError, match="No hosted OAuth policy"):
+            server._request_auth_context(_oauth_entry())
+
+    def test_request_auth_context_requires_an_authenticated_caller(self, monkeypatch):
+        monkeypatch.setattr(
+            "fastmcp.server.dependencies.get_access_token", lambda: None, raising=False
+        )
+        with pytest.raises(ValueError, match="No authenticated access token"):
+            server._request_auth_context(_oauth_entry())
+
+    def test_request_auth_context_surfaces_the_iam_error_body(self, monkeypatch):
+        # context_for() wraps SDK failures, so the IAM response body hangs off the
+        # wrapped cause; it must still reach the operator-facing message.
+        access = SimpleNamespace(token="tok", claims={})
+        monkeypatch.setattr(
+            "fastmcp.server.dependencies.get_access_token", lambda: access, raising=False
+        )
+        cause = RuntimeError("boom")
+        cause.response = SimpleNamespace(status_code=401, text="invalid_grant")
+        wrapped = ValueError("Unable to construct the HTTP IDCS token-exchange signer")
+        wrapped.__cause__ = cause
+
+        class FailingAuth:
+            def context_for(self, _token, *, region=None):
+                raise wrapped
+
+        monkeypatch.setattr(server, "_tenancy_http_auth", lambda _entry: FailingAuth())
+        with pytest.raises(RuntimeError, match="IAM 401: invalid_grant"):
+            server._request_auth_context(_oauth_entry())
 
     def test_build_auth_provider_none_for_session(self, monkeypatch):
         monkeypatch.setenv("ORACLE_MCP_AUTH_METHOD", "session")
         assert server._build_auth_provider() is None
 
-    def test_build_auth_provider_oauth_returns_multitenant(self, monkeypatch, tmp_path):
+    def test_build_auth_provider_oauth_returns_multitenant(self, monkeypatch):
         from oracle.oci_recovery_mcp_server.multitenant_auth import MultiTenantOCIAuth
 
-        monkeypatch.setenv("ORACLE_MCP_AUTH_METHOD", "oauth")
-        monkeypatch.delenv("ORACLE_MCP_TENANCY_REGISTRY", raising=False)
-        monkeypatch.setenv("ORACLE_MCP_IDCS_DOMAIN", "idcs-abc.identity.oraclecloud.com")
-        monkeypatch.setenv("ORACLE_MCP_IDCS_CLIENT_ID", "cid")
-        monkeypatch.setenv("ORACLE_MCP_IDCS_CLIENT_SECRET", "csec")
-        monkeypatch.setenv("ORACLE_MCP_TENANCY_ID", "ocid1.tenancy.oc1..t")
-        monkeypatch.setenv("ORACLE_MCP_REGION", "us-ashburn-1")
+        self._oauth_env(monkeypatch)
         monkeypatch.setenv("ORACLE_MCP_BASE_URL", "http://localhost:9000")
         monkeypatch.setenv("ORACLE_MCP_OAUTH_ALLOW_INSECURE_LOCAL", "true")
         monkeypatch.setenv("ORACLE_MCP_OAUTH_SCOPES", "openid offline_access")
-        monkeypatch.setenv("ORACLE_MCP_OAUTH_STORAGE_DIR", str(tmp_path))
         captured = {}
 
         class FakeOCIProvider:
+            # _cimd_manager mirrors the real provider: the server clears it so
+            # client registration never depends on an outbound metadata fetch.
+            _cimd_manager = object()
+            # Both are rewritten with the qualified scopes: required_scopes is the
+            # upstream authorize fallback, the hook builds the refresh request.
+            required_scopes: list[str] = []
+
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-        with patch("fastmcp.server.auth.providers.oci.OCIProvider", FakeOCIProvider):
+            def update_default_scopes(self, scopes):
+                # The real provider qualifies resource scopes with the audience.
+                captured["default_scopes"] = list(scopes)
+
+            def _prepare_scopes_for_upstream_refresh(self, scopes):
+                return scopes
+
+        # Patch the provider inside oracle-mcp-common: the shared builder, not this
+        # server, is what configures it.
+        with patch("oracle_mcp_common.auth.OCIProvider", FakeOCIProvider):
             provider = server._build_auth_provider()
 
         assert isinstance(provider, MultiTenantOCIAuth)
         assert str(provider.base_url).rstrip("/") == "http://localhost:9000"
         # each tenancy's OAuth routes are path-namespaced per alias
         assert captured["base_url"] == "http://localhost:9000/t/default"
-        assert captured["require_authorization_consent"] is False
+        assert captured["audience"] == "https://recovery.example.com"
+        assert captured["client_id"] == "cid"
         assert list(provider.required_scopes) == ["openid", "offline_access"]
+        # signing key, OAuth state storage, consent and redirect path are FastMCP's
+        # defaults now, not settings this server passes
+        assert "jwt_signing_key" not in captured
+        assert "client_storage" not in captured
+        assert "require_authorization_consent" not in captured
+        assert "redirect_path" not in captured
 
     def _oauth_env(self, monkeypatch):
         for name, value in {
@@ -443,6 +503,7 @@ class TestOAuthMode:
             "ORACLE_MCP_IDCS_DOMAIN": "idcs-abc.identity.oraclecloud.com",
             "ORACLE_MCP_IDCS_CLIENT_ID": "cid",
             "ORACLE_MCP_IDCS_CLIENT_SECRET": "csec",
+            "ORACLE_MCP_IDCS_AUDIENCE": "https://recovery.example.com",
             "ORACLE_MCP_TENANCY_ID": "ocid1.tenancy.oc1..t",
             "ORACLE_MCP_REGION": "us-ashburn-1",
         }.items():
@@ -468,25 +529,21 @@ class TestOAuthMode:
         with pytest.raises(RegistryError, match="https"):
             server._build_auth_provider()
 
-    def test_build_auth_provider_allows_http_localhost_with_explicit_dev_flag(
-        self, monkeypatch, tmp_path
-    ):
+    def test_build_auth_provider_allows_http_localhost_with_explicit_dev_flag(self, monkeypatch):
         self._oauth_env(monkeypatch)
         monkeypatch.setenv("ORACLE_MCP_BASE_URL", "http://localhost:8000")
         monkeypatch.setenv("ORACLE_MCP_OAUTH_ALLOW_INSECURE_LOCAL", "true")
-        monkeypatch.setenv("ORACLE_MCP_OAUTH_STORAGE_DIR", str(tmp_path))
 
-        with patch("fastmcp.server.auth.providers.oci.OCIProvider"):
+        with patch("oracle_mcp_common.auth.OCIProvider"):
             provider = server._build_auth_provider()
 
         assert str(provider.base_url).rstrip("/") == "http://localhost:8000"
 
-    def test_build_auth_provider_accepts_https_base_url(self, monkeypatch, tmp_path):
+    def test_build_auth_provider_accepts_https_base_url(self, monkeypatch):
         self._oauth_env(monkeypatch)
         monkeypatch.setenv("ORACLE_MCP_BASE_URL", "https://mcp.example.com")
-        monkeypatch.setenv("ORACLE_MCP_OAUTH_STORAGE_DIR", str(tmp_path))
 
-        with patch("fastmcp.server.auth.providers.oci.OCIProvider"):
+        with patch("oracle_mcp_common.auth.OCIProvider"):
             provider = server._build_auth_provider()
 
         assert str(provider.base_url).rstrip("/") == "https://mcp.example.com"
@@ -556,6 +613,64 @@ class TestCachePartitioning:
         assert "cA" in ids_a and "cB" in ids_b
         assert "cB" not in ids_a  # tenant B never leaks into tenant A
         assert calls == ["tA", "tB"]  # tA's 2nd call served from its own cache
+
+    def test_compartment_cache_partitioned_by_caller_within_a_tenant(self, monkeypatch):
+        # The listing is fetched with access_level="ACCESSIBLE", so it reflects the
+        # calling identity's permissions. Two users of the SAME tenancy must never
+        # share an entry, or a broadly-permissioned user's compartment tree would be
+        # served to a restricted one.
+        server._COMPARTMENT_CACHE["entries"].clear()
+        current = {"sub": "alice"}
+        visible = {"alice": [SimpleNamespace(id="c-all")], "bob": [SimpleNamespace(id="c-few")]}
+        calls = []
+
+        def fake_list(only_one_page, limit=100):
+            calls.append(current["sub"])
+            return list(visible[current["sub"]])
+
+        monkeypatch.setattr(server, "list_all_compartments_internal", fake_list)
+        monkeypatch.setattr(server, "get_tenancy", lambda: "same-tenancy")
+        monkeypatch.setattr(server, "_effective_auth_method", lambda: "oauth")
+        monkeypatch.setattr(
+            server,
+            "get_identity_client",
+            lambda **k: SimpleNamespace(
+                get_compartment=lambda compartment_id: SimpleNamespace(
+                    data=SimpleNamespace(id=compartment_id)
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            "fastmcp.server.dependencies.get_access_token",
+            lambda: SimpleNamespace(claims={"sub": current["sub"]}, token="tok"),
+            raising=False,
+        )
+
+        alice = server._list_all_compartments_cached(request_id="r")
+        current["sub"] = "bob"
+        bob = server._list_all_compartments_cached(request_id="r")
+        current["sub"] = "alice"
+        server._list_all_compartments_cached(request_id="r")
+
+        assert "c-all" in [getattr(c, "id", None) for c in alice]
+        ids_bob = [getattr(c, "id", None) for c in bob]
+        assert "c-few" in ids_bob
+        assert "c-all" not in ids_bob  # alice's compartments never reach bob
+        assert calls == ["alice", "bob"]  # alice's 2nd call served from her own entry
+
+    def test_caller_cache_key_never_shares_an_entry_without_an_identity(self, monkeypatch):
+        # No usable caller identity in oauth mode must isolate, not fall back to a
+        # shared key: the fallback is the failure mode this partitioning prevents.
+        monkeypatch.setattr(server, "_effective_auth_method", lambda: "oauth")
+        monkeypatch.setattr(
+            "fastmcp.server.dependencies.get_access_token", lambda: None, raising=False
+        )
+        assert server._caller_cache_key() != server._caller_cache_key()
+
+    def test_caller_cache_key_is_inert_for_profile_auth(self, monkeypatch):
+        # One process, one operator credential: nothing to separate.
+        monkeypatch.setattr(server, "_effective_auth_method", lambda: "session")
+        assert server._caller_cache_key() == ""
 
 
 class TestRecoveryTools:

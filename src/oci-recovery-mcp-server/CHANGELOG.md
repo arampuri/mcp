@@ -5,6 +5,110 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.1.0
+
+Hosted OAuth moves onto the shared `oracle-mcp-common` authentication path. The
+server no longer configures OAuth providers or builds token-exchange signers
+itself, which removes four local settings and requires one new one.
+
+### Breaking Changes
+
+- **Hosted `oauth` authentication now goes through `oracle-mcp-common` end to
+  end.** Each tenancy's provider is built by
+  `oracle_mcp_common.build_idcs_http_auth()`, and every request's OCI signer comes
+  from that tenancy's `IDCSHttpAuth.context_for()`. 3.0.0 used the shared library
+  only for `apikey`/`session` credential resolution and configured its own OAuth
+  providers and `TokenExchangeSigner`s; those local paths are gone.
+- **Tenancy registry entries now require `audience`.** Each entry must carry the
+  primary audience of that tenancy's IAM resource application (single-tenant
+  fallback: `ORACLE_MCP_IDCS_AUDIENCE`). Access tokens are now verified against
+  this `aud` claim and the value is sent to `/authorize` and `/token`, so it must
+  match the IAM domain's configuration or sign-in for that tenancy fails.
+- **Registry `jwt_signing_key` and `ORACLE_MCP_JWT_SIGNING_KEY` removed.** FastMCP
+  derives each tenancy's token-signing key from that tenancy's `client_secret`, so
+  it is stable across restarts and workers and distinct per tenancy without being
+  configured. A registry entry that still sets `jwt_signing_key` fails startup
+  rather than having the value silently ignored. Rotating a `client_secret` now
+  also invalidates that tenancy's issued tokens.
+- **`ORACLE_MCP_OAUTH_STORAGE_DIR` removed.** Per-tenancy OAuth state now lives
+  under FastMCP's home directory (`~/.fastmcp/oauth-proxy/`, relocatable with
+  `FASTMCP_HOME`), encrypted at rest, in a per-tenancy directory. Deployments that
+  mounted the old `.oauth_state` directory must persist the new location instead;
+  an ephemeral home directory forces clients to re-register after a restart.
+  `FASTMCP_HOME` is resolved when FastMCP is imported, before the server reads its
+  env file, so it must be exported rather than set in that file.
+- **`ORACLE_MCP_OAUTH_REQUIRE_CONSENT` removed and consent is now on.** The first
+  authorization for a tenancy shows a consent screen; later tool calls reuse the
+  granted session.
+- **`ORACLE_MCP_OAUTH_REDIRECT_PATH` removed.** The callback path is `/auth/callback`
+  under each tenancy's mount, so the registered redirect URI
+  `<base_url>/t/<alias>/auth/callback` is unchanged.
+
+### Changed
+
+- **CIMD client registration is disabled.** FastMCP enables Client ID Metadata
+  Documents by default, which lets a client send an HTTPS URL as its `client_id`
+  and requires this server to fetch that URL to learn the client's metadata. That
+  fetch is an outbound internet request made with pinned DNS and redirects
+  disabled, so it fails on a host with no egress, and also on one whose egress is
+  a CONNECT proxy. The failure reached the user as "The client ID ... was not
+  found in the server's client registry" at `/authorize`, which reads like a
+  client bug. Clients now register with DCR against `/t/<alias>/register`, which
+  never leaves the host. Startup fails loudly if a future FastMCP release renames
+  the private attribute this relies on.
+
+### Fixed
+
+- **Sign-in failed with `invalid_scope` because resource scopes were sent to IDCS
+  unqualified.** IDCS names a resource application's scopes by concatenating the
+  application's primary audience with the scope name, and `/authorize` accepts
+  only that form, so `oci_mcp.recovery.invoke` was rejected and no tenancy could
+  complete a login. The access token IDCS issues carries the scope *bare*,
+  though, and that token is re-validated on every request — so qualifying the
+  configured value instead simply moved the failure to `401 invalid_token` on
+  the first tool call. `ORACLE_MCP_OAUTH_SCOPES` is now bare, as verification
+  requires, and each tenancy's provider qualifies the resource scopes it
+  advertises to clients with that tenancy's own audience — in DCR defaults and
+  in protected-resource metadata alike, since a client requests whatever it is
+  told is supported and the proxy refuses an authorize request carrying anything
+  else. Startup fails loudly if a future FastMCP release drops the method this
+  relies on.
+- **Sign-in still failed with `invalid_scope` for clients that omit `scope`.**
+  Qualifying the scopes a client is *told* about only helps a client that asks
+  for them. `/authorize` may arrive with no `scope` parameter at all, and the
+  proxy then falls back to its own `required_scopes` — which stayed bare, so the
+  upstream request carried an unqualified resource scope and IDCS rejected it.
+  A third path had the same gap: the refresh request is built from the scopes
+  stored on the refresh token, and those were parsed bare out of the IDCS token
+  response, so a session would have died at its first refresh an hour after a
+  sign-in that looked completely successful. Both fallbacks are now qualified
+  with the tenancy's audience, alongside the advertised scopes. Verification is
+  unaffected — it compares against the token verifier's own bare scopes — and
+  startup now refuses any provider that verifies the id_token, since that mode
+  makes `required_scopes` the enforcement point as well and the two uses need
+  opposite forms.
+- **OAuth discovery required a header no client can send there.** Protected-resource
+  metadata is fetched before any MCP session exists, and `X-OCI-Tenancy` rides only
+  on requests to the MCP URL itself, so discovery always arrived without it and was
+  answered with `tenancy_required`. Clients then retried root well-known paths this
+  server does not serve, and the resulting `404 Not Found` body reached the user as
+  an unparseable OAuth error. When exactly one tenancy is configured there is nothing
+  to disambiguate, so discovery is now answered for it. An unknown tenancy name is
+  still rejected, and a multi-tenancy registry still requires the header.
+- **Compartment cache could serve one caller's compartments to another.** The
+  compartment listing is fetched with `access_level="ACCESSIBLE"`, so it contains
+  exactly what the calling identity may see, but it was cached per tenancy only. In
+  the hosted multi-tenant deployment two users of the same tenancy shared that
+  entry, so a broadly-permissioned user's compartment tree could be served to a
+  restricted one. The cache is now keyed by tenancy **and** caller identity; in
+  `session`/`apikey` mode, where the whole process shares one credential, the key is
+  unchanged.
+- Per-tenancy OAuth providers now derive their protected-resource URL from the
+  server's public base URL rather than their own `/t/<alias>` mount, so the resource
+  indicator a client sends is the one the provider validates and the one the tokens
+  it issues are bound to. Tokens issued by 3.0.0 carry the old audience and are
+  rejected; affected clients sign in again.
+
 ## 3.0.0
 
 ### Breaking Changes

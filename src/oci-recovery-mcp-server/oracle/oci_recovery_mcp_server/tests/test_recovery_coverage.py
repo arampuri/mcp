@@ -108,7 +108,7 @@ class TestRestoredClientFactoryCoverage:
         side_effect=lambda client, **_: client,
     )
     @patch("oracle.oci_recovery_mcp_server.server.oci.recovery.DatabaseRecoveryClient")
-    @patch("oracle.oci_recovery_mcp_server.server._build_token_exchange_signer")
+    @patch("oracle.oci_recovery_mcp_server.server._request_auth_context")
     @patch("oracle.oci_recovery_mcp_server.server._current_tenancy")
     @patch(
         "oracle.oci_recovery_mcp_server.server._effective_auth_method",
@@ -118,7 +118,7 @@ class TestRestoredClientFactoryCoverage:
         self,
         _mock_auth_method,
         mock_current_tenancy,
-        mock_build_signer,
+        mock_auth_context,
         mock_client,
         _mock_wrap,
     ):
@@ -128,7 +128,10 @@ class TestRestoredClientFactoryCoverage:
             region="us-ashburn-1",
         )
         first, second = object(), object()
-        mock_build_signer.side_effect = [first, second]
+        mock_auth_context.side_effect = [
+            SimpleNamespace(config={"region": "us-phoenix-1"}, signer=first),
+            SimpleNamespace(config={"region": "us-phoenix-1"}, signer=second),
+        ]
 
         server.get_recovery_client(region="us-phoenix-1", request_id="rid")
         server.get_recovery_client(region="us-phoenix-1", request_id="rid")
@@ -500,7 +503,9 @@ def test_client_factories_cover_profile_and_oauth_auth_paths(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        server, "_build_token_exchange_signer", lambda _entry: oauth_signer
+        server,
+        "_request_auth_context",
+        lambda _entry, region=None: SimpleNamespace(config={}, signer=oauth_signer),
     )
 
     assert server.get_recovery_client(region="us-phoenix-1")[1] == "recovery"
@@ -565,7 +570,9 @@ def test_new_client_factories_cover_limits_work_requests_and_subscription(monkey
         ),
     )
     monkeypatch.setattr(
-        server, "_build_token_exchange_signer", lambda _entry: oauth_signer
+        server,
+        "_request_auth_context",
+        lambda _entry, region=None: SimpleNamespace(config={}, signer=oauth_signer),
     )
     assert server.get_work_request_client(region="us-sanjose-1")[1] == "work_requests"
     assert server.get_limits_client(region="us-sanjose-1")[1] == "limits"
@@ -2236,5 +2243,3 @@ def test_database_list_branches_and_tool_error_paths(monkeypatch):
         server.onboard_database_to_recovery_service()
         == server.ONBOARD_DATABASE_TO_RECOVERY_SERVICE_PROMPT
     )
-
-
