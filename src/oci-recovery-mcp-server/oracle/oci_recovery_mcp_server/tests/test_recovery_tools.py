@@ -658,6 +658,51 @@ class TestCachePartitioning:
         assert "c-all" not in ids_bob  # alice's compartments never reach bob
         assert calls == ["alice", "bob"]  # alice's 2nd call served from her own entry
 
+    def test_compartment_cache_partitioned_when_tokens_omit_sub(self, monkeypatch):
+        # Providers may omit sub. Two humans then arrive with empty claims and the
+        # SAME registered client_id; only the per-session token tells them apart.
+        server._COMPARTMENT_CACHE["entries"].clear()
+        current = {"token": "token-alice"}
+        visible = {
+            "token-alice": [SimpleNamespace(id="c-all")],
+            "token-bob": [SimpleNamespace(id="c-few")],
+        }
+        calls = []
+
+        def fake_list(only_one_page, limit=100):
+            calls.append(current["token"])
+            return list(visible[current["token"]])
+
+        monkeypatch.setattr(server, "list_all_compartments_internal", fake_list)
+        monkeypatch.setattr(server, "get_tenancy", lambda: "same-tenancy")
+        monkeypatch.setattr(server, "_effective_auth_method", lambda: "oauth")
+        monkeypatch.setattr(
+            server,
+            "get_identity_client",
+            lambda **k: SimpleNamespace(
+                get_compartment=lambda compartment_id: SimpleNamespace(
+                    data=SimpleNamespace(id=compartment_id)
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            "fastmcp.server.dependencies.get_access_token",
+            lambda: SimpleNamespace(
+                claims={}, client_id="shared-client", token=current["token"]
+            ),
+            raising=False,
+        )
+
+        alice = server._list_all_compartments_cached(request_id="r")
+        current["token"] = "token-bob"
+        bob = server._list_all_compartments_cached(request_id="r")
+
+        ids_bob = [getattr(c, "id", None) for c in bob]
+        assert "c-all" in [getattr(c, "id", None) for c in alice]
+        assert "c-few" in ids_bob
+        assert "c-all" not in ids_bob  # the shared client_id must not merge them
+        assert calls == ["token-alice", "token-bob"]  # bob got no cache hit
+
     def test_caller_cache_key_never_shares_an_entry_without_an_identity(self, monkeypatch):
         # No usable caller identity in oauth mode must isolate, not fall back to a
         # shared key: the fallback is the failure mode this partitioning prevents.
@@ -666,6 +711,42 @@ class TestCachePartitioning:
             "fastmcp.server.dependencies.get_access_token", lambda: None, raising=False
         )
         assert server._caller_cache_key() != server._caller_cache_key()
+
+    def test_caller_cache_key_isolates_tokens_sharing_one_oauth_client_id(self, monkeypatch):
+        # A client_id names the registered application, not the human: several
+        # users of the same MCP client share it. If it ever reached the key, one
+        # user's ACCESSIBLE compartment listing would be served to another.
+        monkeypatch.setattr(server, "_effective_auth_method", lambda: "oauth")
+        current = {"token": "token-alice"}
+        monkeypatch.setattr(
+            "fastmcp.server.dependencies.get_access_token",
+            lambda: SimpleNamespace(claims={}, client_id="shared-client", token=current["token"]),
+            raising=False,
+        )
+        alice = server._caller_cache_key()
+        current["token"] = "token-bob"
+        bob = server._caller_cache_key()
+
+        assert alice and bob
+        assert alice != bob
+        assert "shared-client" not in alice + bob
+
+    def test_caller_cache_key_uses_jti_when_the_token_omits_sub(self, monkeypatch):
+        # Same registered client, distinct sessions: jti keeps them apart and,
+        # unlike the raw token, is stable for the life of that token.
+        monkeypatch.setattr(server, "_effective_auth_method", lambda: "oauth")
+        current = {"jti": "jti-alice"}
+        monkeypatch.setattr(
+            "fastmcp.server.dependencies.get_access_token",
+            lambda: SimpleNamespace(
+                claims={"jti": current["jti"]}, client_id="shared-client", token="tok"
+            ),
+            raising=False,
+        )
+        alice = server._caller_cache_key()
+        assert alice == server._caller_cache_key()  # stable across calls
+        current["jti"] = "jti-bob"
+        assert server._caller_cache_key() != alice
 
     def test_caller_cache_key_is_inert_for_profile_auth(self, monkeypatch):
         # One process, one operator credential: nothing to separate.

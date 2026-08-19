@@ -1179,8 +1179,10 @@ def _caller_cache_key() -> str:
     this contributes nothing to the key.
 
     The subject claim identifies the human, not the session, so the cache still
-    survives a token refresh. It is hashed because these keys are cheap to end up
-    in a log line or a debug dump.
+    survives a token refresh. When the provider omits it we fall back to
+    per-session values (jti, then the raw token), which costs a refetch after a
+    refresh but never merges two callers. The key is hashed because it is cheap
+    to end up in a log line or a debug dump.
     """
     if _effective_auth_method() != "oauth":
         return ""
@@ -1189,10 +1191,11 @@ def _caller_cache_key() -> str:
 
         access = get_access_token()
         claims = (getattr(access, "claims", None) or {}) if access is not None else {}
-        subject = claims.get("sub") or getattr(access, "client_id", None)
-        # No usable identity: fall back to the raw token so the entry is scoped to
-        # this session only. Never fall back to a shared key -- that is the leak.
-        subject = subject or getattr(access, "token", None)
+        # Only ever caller-specific values here. client_id identifies the
+        # registered OAuth application, which many humans share, so it must
+        # never appear in this chain. Some providers omit sub; jti and the raw
+        # token are both per-session, so the entry is scoped to this session.
+        subject = claims.get("sub") or claims.get("jti") or getattr(access, "token", None)
     except Exception:
         subject = None
     if not subject:
