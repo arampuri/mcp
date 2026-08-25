@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- **New `diagnose_recovery_service_issue` guidance tool.** Returns an
+  evidence-driven, access-first diagnostic workflow for investigating Oracle
+  Database backup, protection, and recoverability problems in a Recovery Service
+  environment. Like the other guidance tools, it exposes the prompt text as an
+  ordinary tool so clients without prompt support can call it.
+
+### Fixed
+
+- **Multi-tenant OAuth discovery is no longer cacheable across tenancies.** The
+  single `/.well-known/oauth-protected-resource/mcp` endpoint selects its answer
+  from the `X-OCI-Tenancy` request header but declared no `Vary` and no cache
+  directives, so a shared cache could serve one tenancy the authorization server
+  of another. Every response from that endpoint -- including the `400` and the
+  CORS preflight -- now carries `Vary: X-OCI-Tenancy`, `Cache-Control: no-store,
+  private`, and `Pragma: no-cache`.
+
 ## 3.1.0
 
 Hosted OAuth moves onto the shared `oracle-mcp-common` authentication path. The

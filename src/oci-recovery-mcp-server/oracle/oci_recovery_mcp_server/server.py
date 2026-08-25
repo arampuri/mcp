@@ -140,6 +140,7 @@ if _ENV_FILE:
 - get_db_system
 - oci_recovery_service_dashboard_prompt
 - onboard_database_to_recovery_service
+- diagnose_recovery_service_issue
 """
 
 # Logging setup
@@ -208,6 +209,9 @@ OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT = (
 ).read_text(encoding="utf-8")
 ONBOARD_DATABASE_TO_RECOVERY_SERVICE_PROMPT = (
     _PROMPTS_DIR / "onboard_database_to_recovery_service.txt"
+).read_text(encoding="utf-8")
+DIAGNOSE_RECOVERY_SERVICE_ISSUE_PROMPT = (
+    _PROMPTS_DIR / "diagnose_recovery_service_issue.txt"
 ).read_text(encoding="utf-8")
 
 logger = logging.getLogger(__name__)
@@ -4606,6 +4610,16 @@ def oci_recovery_service_dashboard_prompt() -> str:
 )
 def onboard_database_to_recovery_service() -> str:
     return ONBOARD_DATABASE_TO_RECOVERY_SERVICE_PROMPT
+
+
+@mcp.tool(
+    description=(
+        "Use this tool first whenever the user's underlying goal is to investigate, explain, or assess the health of Oracle Database backup, protection, or recoverability in an environment using Recovery Service. This includes explicit failures as well as implicit concerns such as unexpected backup behavior, stale or missing backups, protection lag, missing recovery points, restore/PITR problems, policy or retention behavior, RMAN issues, or questions about whether a protected database is healthy and recoverable. Also use it when the user asks whether anything is wrong with the protection environment, even without reporting an error. The tool provides an evidence-driven, access-first diagnostic workflow that traces the actual execution path, acquires relevant evidence, tests competing root-cause hypotheses, independently assesses recoverability, and guides safe remediation and verification. Do not use it for general database questions unrelated to backup, recovery, protection, or recoverability."
+    )
+)
+def diagnose_recovery_service_issue() -> str:
+    """Return Recovery Service diagnostic guidance as a tool for clients without prompt support."""
+    return DIAGNOSE_RECOVERY_SERVICE_ISSUE_PROMPT
 
 
 def main():
