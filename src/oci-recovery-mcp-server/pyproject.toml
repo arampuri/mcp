@@ -46,6 +46,29 @@ oracle-mcp-common = { workspace = true }
 [tool.uv.workspace]
 members = [
     "../common",
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/.coverage*",
+  "/htmlcov/**",
+  "/.pytest_cache/**",
+  "/.ruff_cache/**",
+  "/.venv/**",
+  "/venv/**",
+  "/dist/**",
+  "/build/**",
+  "/uv.lock",
+  "**/__pycache__/**",
+  "**/*.py[cod]",
+  "/.DS_Store",
+  "/.env",
+  "/.env.*",
+  "/.claude/**",
+  "/.cline/**",
+  "/.roo/**",
+  "/.cursor/**",
+  "/mcp_settings*.json",
+  "/Containerfile",
+  "/.containerignore",
 ]
 
 [dependency-groups]

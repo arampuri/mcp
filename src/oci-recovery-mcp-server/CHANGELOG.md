@@ -165,6 +165,11 @@ itself, which removes four local settings and requires one new one.
   were resolved from. The OCI SDK only falls back to `OCI_CONFIG_FILE` when
   `~/.oci/config` is absent, so with both present these lookups could resolve a
   different profile than the request signer.
+## 2.1.2
+
+### Changed
+
+- Excluded development artifacts, local configuration, and container build files from source-distribution packages.
 
 ## 2.1.1
 

@@ -2,6 +2,12 @@
 
 All notable changes to `oracle-mcp-common` are documented in this file.
 
+## 0.1.3
+
+### Changed
+
+- Excluded development artifacts and local configuration from the shared library’s source distribution.
+
 ## 0.1.2
 
 ### Fixed
