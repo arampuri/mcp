@@ -46,6 +46,8 @@ oracle-mcp-common = { workspace = true }
 [tool.uv.workspace]
 members = [
     "../common",
+]
+
 [tool.hatch.build.targets.sdist]
 exclude = [
   "/.coverage*",
