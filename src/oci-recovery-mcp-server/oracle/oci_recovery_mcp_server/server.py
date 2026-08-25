@@ -98,7 +98,7 @@ from oracle.oci_recovery_mcp_server.models import (
 )
 
 from . import __project__, __version__
-from .multitenant_auth import TENANT_CLAIM, MultiTenantOCIAuth
+from .multitenant_auth import TENANCY_HEADER, TENANT_CLAIM, MultiTenantOCIAuth
 from .tenancy_registry import (
     RegistryError,
     TenancyEntry,
@@ -839,7 +839,7 @@ def _current_tenancy() -> TenancyEntry:
     try:
         from fastmcp.server.dependencies import get_http_headers
 
-        hdr = (get_http_headers() or {}).get("x-oci-tenancy")
+        hdr = (get_http_headers() or {}).get(TENANCY_HEADER.lower())
     except Exception:
         hdr = None
     if hdr:
