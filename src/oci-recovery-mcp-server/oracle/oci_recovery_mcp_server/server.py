@@ -8,7 +8,7 @@ https://oss.oracle.com/licenses/upl.
 # This file defines the FastMCP server for Oracle Recovery Service related tools.
 # It wires up:
 # - Logging (file + optional console with rotation)
-# - OCI client factories (Recovery, Identity, Database, Monitoring)
+# - OCI client factories (Recovery, Identity, Database, Monitoring, Limits)
 # - Helper utilities (tenancy/compartment discovery, DB Home discovery)
 # - A set of MCP tools (decorated functions) that call OCI SDKs, paginate responses,
 #   and map SDK models into server-specific dataclasses found in models.py.
@@ -21,32 +21,49 @@ https://oss.oracle.com/licenses/upl.
 # 5) Return typed results (summaries/objects) or computed aggregations.
 #
 # Main() chooses the transport:
-# - If ORACLE_MCP_HOST and ORACLE_MCP_PORT are set: run HTTP transport.
-# - Otherwise run stdio transport (default for MCP).
+# - If ORACLE_MCP_HOST and ORACLE_MCP_PORT are set: Streamable HTTP, with OCI IAM
+#   (IDCS) sign-in per caller.
+# - Otherwise stdio (default for MCP), on the operator's own OCI profile credentials.
 #
 # Important robustness choices:
 # - We add an "additional_user_agent" string to all OCI client configs for traceability.
-# - We sign requests with a SecurityTokenSigner using the configured security token file.
+# - All credential resolution is delegated to the shared oracle-mcp-common library:
+#   build_auth_context() for profile-backed session/apikey credentials, and
+#   build_idcs_http_auth()/IDCSHttpAuth.context_for() for HTTP.
 # - We try to be resilient to SDK shape differences by using getattr/__dict__/to_dict
 #   wherever possible, especially for pagination and nested model fields.
 # - We log key milestones and counts for better operability and diagnostics.
 
-import configparser
+import hashlib
+import inspect
 import json
 import logging
 import os
+from pathlib import Path
+import re
 import time
 import traceback
 import uuid
+from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
-from typing import Annotated, Any, Callable, Literal, Optional
+from typing import Annotated, Any, Callable, Optional
 
 import oci
+from dotenv import find_dotenv, load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.oci import OCIProvider
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_request
 from fastmcp.utilities.auth import parse_scopes
 from oci.monitoring.models import SummarizeMetricsDataDetails
+from oracle_mcp_common import (
+    AuthOptions,
+    AuthType,
+    IDCSHttpAuth,
+    build_auth_context,
+    build_idcs_http_auth,
+    resolve_auth_type,
+    resolve_config_file,
+    resolve_profile_name,
+)
 
 # Database Service models and mappers
 from oracle.oci_recovery_mcp_server.models import (
@@ -58,7 +75,6 @@ from oracle.oci_recovery_mcp_server.models import (
     DatabaseSummary,
     DbSystem,
     DbSystemSummary,
-    WorkRequest,
     ProtectedDatabase,
     ProtectedDatabaseBackupDestinationItem,
     ProtectedDatabaseBackupDestinationSummary,
@@ -68,6 +84,7 @@ from oracle.oci_recovery_mcp_server.models import (
     ProtectedDatabaseSummary,
     ProtectionPolicy,
     RecoveryServiceSubnet,
+    WorkRequest,
     map_backup,
     map_backup_summary,
     map_database,
@@ -77,24 +94,33 @@ from oracle.oci_recovery_mcp_server.models import (
     map_db_backup_config,
     map_db_system,
     map_db_system_summary,
-    map_work_request,
     map_protected_database,
     map_protected_database_summary,
     map_protection_policy,
     map_recovery_service_subnet,
     map_recovery_service_subnet_details,
+    map_work_request,
 )
 
 from . import __project__, __version__
 
+# Load configuration from a .env file (if present) so all settings can live in one
+# config file instead of being exported as environment variables. This runs before
+# any module-level env reads below. Precedence: real environment variables win over
+# the file (override=False). Point ORACLE_MCP_ENV_FILE at a specific file to override
+# the default ".env" discovery (which walks up from the current working directory).
+_ENV_FILE = os.getenv("ORACLE_MCP_ENV_FILE") or find_dotenv(usecwd=True)
+if _ENV_FILE:
+    load_dotenv(_ENV_FILE, override=False)
+
 """MCP tools available in this server:
+- fetch_regions_subscribed
 - list_protected_databases
 - get_protected_database
 - summarize_protected_database_health
 - summarize_protected_database_redo_status
 - summarize_backup_space_used
 - check_recovery_service_limits
-- list_subscribed_regions
 - list_protection_policies
 - get_protection_policy
 - list_recovery_service_subnets
@@ -110,181 +136,10 @@ from . import __project__, __version__
 - get_db_home
 - list_db_systems
 - get_db_system
+- oci_recovery_service_dashboard_prompt
+- onboard_database_to_recovery_service
+- diagnose_recovery_service_issue
 """
-
-OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT = """
-You are an expert dashboard generator.
-You very well know how to generate a presentable charts for the executives.
-Make sure the chart is loadable and there are no errors while loading chart.
-
-Visualise OCI Recovery - Dashboard charts in one html document with below metrics in the given compartment.
-Display the Title - OCI Recovery - Dashboard
-Under the Title, mention the compartment name.
-Under this compartment name add a note: Generated using Recovery Service MCP Server
-Add the date of report generation
-
-Main page (Overview)
-In first row, summarise base db systems based on backup destination - DBRS, OBJECT_STORE or UNCONFIGURED
-using donut chart.
-Use tool summarise_protected_database_backup_destination.
-Use title - Databases categorised by backup destination.
-Replace DBRS with "RecoveryService" while generating the report.
-In another frame, first row, second column, With title Protected Database Space:
-Report total backup space used by protected databases - using tool summarize_backup_space_used.
-Note: Space used by ACTIVE/DELETE SCHEDULED protected databases.
-In Second Row first column, Summarise protected database based on lifecycle status using donut chart.
-Title - protected databases by lifecycle state.
-Make sure the values are based on actual data.
-Double check this.
-In Second row, summarise protected databases on health status - PROTECTED, WARNING, ALERT using donut chart.
-Use tool summarize_protected_database_health.
-Title - ACTIVE protected databases by health state.
-In Second row, summarise protected databases on realtime redo status - ENABLED, DISABLED using donut chart.
-Use tool summarize_protected_database_redo_status.
-Title - ACTIVE protected databases by real time redo.
-
-In the Fourth row, report the protected databases with OCID, database db unique name, health status,
-lifecycle state,
-redo status, backup space used in tabular format.
-Filterable columns - Health status, Redo status, life cycle state.
-This data is very important.
-Extract details carefully from list protecetd datbase output and map the columns to the OCIDs.
-Be diligent while filling up this table.
-Don't miss the filters.
-
-In another tab named - Backup Details
-Tool to use list backups with compartment id as argument.
-You are an expert dashboard generator.
-You very well know how to generate a presentable charts for the executives.
-Make sure the chart is loadable and there are no errors while loading chart.
-The lines in graph are clearly visible and well positioned.
-
-Generate a line chart showing backup creation timelines for databases in the mentioned compartment.
-Each database is represented by a distinct line, with points marking individual backup events
-based on 'time_started'
-The chart is styled for executive presentation, with a clean layout, legend, and tooltips
-X axis - Creation date/ Start date
-Y axis - db_unique_name
-
-Generate a line chart showing time taken by each backup for databases in the mentioned compartment.
-Each database is represented by a distinct line, with points marking individual backup events
-based on 'duration'
-If user hovers over individual points then they should get details such as exact duration and type of backup
-(FULL or INCREMENTAL).
-- X axis: Creation date / Start date
-- Y axis: duration_minutes.
-
-Give your insight on:
-- If any backup has taken more time or less time than usual pattern
-- Is there any backup missing in the pattern
-- If backup is manually taken or LTR call that out separately
-
-IMPORTANT:
-Make sure charts are loadable and renderable clearly in html.
-Double check this condition.
-There should be no missing line charts.
-Do not add date/time on the points unless user hovers over that point.
-
-In another tab named - Backup space usage
-Tool to use get_recovery_service_metrics and resolution used 1 day.
-
-Generate a line chart of backup space used by each protected databases in last 5 days - using tool
-get_recovery_service_metrics and metricName SpaceUsedForRecoveryWindow.
-Each protected database is represented by a distinct line with points marking individual space.
-
-Give your insight on:
-- If there are any anomalies in the space usage pattern.
-- Any other space anomaly you can think of
-
-Add an executive KPI summary row directly below the dashboard title.
-
-Create 4 KPI cards displayed horizontally using Bootstrap grid:
-1. Total Protected Databases
-2. Healthy Databases (%)
-3. Redo Shipping Enabled (%)
-4. Total Backup Space Used (GB)
-
-Rules:
-- Use existing dashboard data to calculate KPI values.
-- KPI cards must be visually compact and equal height.
-- Each KPI card should contain:
-    - Small uppercase label
-    - Large bold metric value
-    - Optional subtext (e.g. "of 3 databases")
-
-Styling:
-- Use soft card backgrounds with rounded corners.
-- Center-align KPI content.
-- Use large font (2–2.5rem) for KPI numbers.
-- Use subtle shadows.
-- Maintain spacing with Bootstrap g-4.
-
-Layout:
-- KPI row must appear ABOVE all charts.
-- Dashboard width remains 75vw.
-- On mobile, stack KPI cards vertically.
-
-Data logic:
-- Total Protected Databases = count of protected databases.
-- Healthy % = (PROTECTED / total) * 100.
-- Redo Enabled % = (ENABLED / total) * 100.
-- Total Backup Space = sum of space used.
-
-After KPIs, keep charts as secondary visual detail.
-
-IMPORTANT
-
-Layout rules for HTML dashboard:
-- Wrap all content in a .dashboard-container:
-    width: 75vw;
-    max-width: 1200px;
-    margin: 0 auto;
-- Center the dashboard horizontally.
-- Do NOT use full screen width.
-- On mobile (<768px), expand dashboard to 95vw.
-
-Chart container sizing:
-- Do NOT use a single default height for all charts.
-- Overview donut charts MUST be compact:
-    height: 260px.
-- Timeline / line charts:
-    height: 360px.
-- Space usage charts:
-    height: 300px.
-- Apply CSS classes per chart type (overview-donut, timeline-chart, space-chart).
-- Ensure donuts appear compact and not vertically stretched.
-
-When using Chart.js:
-- NEVER use custom HTML legends.
-- NEVER use absolute positioning over canvas.
-- Always use native Chart.js legend positioned on the right.
-- Add layout.padding = 20 to every chart.
-- For doughnut charts:
-    cutout: '65%'
-    radius: '85%'
-- Ensure charts fit inside containers without clipping.
-- Avoid overlapping elements.
-- Maintain clean spacing between panels.
-- Optimize layout for presentation-quality visuals.
-Make sure chart sizes are equal and fit well inside demarcation.
-Make sure there are no rendering issues.
-Don't generate truncated html file.
-Make sure its a complete file without any syntax issues.
-Make sure legends are written on the rightside of donut chart and within frame.
-Show all the legends and next to legends mention the count as well in brackets.
-Make sure titles are on the top of the donut chart.
-Make sure title, donut chart and legends fit within the frame.
-
-Always render charts for every tab.
-Include required JS adapters.
-Initialize charts after tab activation.
-
-Use soft colors in the chart - executive appealing colors.
-Demarcate between the rows.
-Since this is a dashboard make sure user gets the visibility of most charts without scrolling.
-Create a responsive layout minimizing scrolling.
-"""
-
 
 # Logging setup
 def setup_logging():
@@ -345,6 +200,18 @@ def setup_logging():
 
 
 setup_logging()
+_PROMPTS_DIR = Path(__file__).parent / "data" / "prompts"
+
+OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT = (
+    _PROMPTS_DIR / "oci_recovery_service_dashboard.txt"
+).read_text(encoding="utf-8")
+ONBOARD_DATABASE_TO_RECOVERY_SERVICE_PROMPT = (
+    _PROMPTS_DIR / "onboard_database_to_recovery_service.txt"
+).read_text(encoding="utf-8")
+DIAGNOSE_RECOVERY_SERVICE_ISSUE_PROMPT = (
+    _PROMPTS_DIR / "diagnose_recovery_service_issue.txt"
+).read_text(encoding="utf-8")
+
 logger = logging.getLogger(__name__)
 
 # Exhaustive structured logging helpers
@@ -438,19 +305,202 @@ def _log_event(
         logger.log(level, str(rec))
 
 
+_MCP_OPC_REQUEST_ID_PREFIX = "rcvmcp"
+_MCP_INSTALLATION_ID_ENV = "ORACLE_MCP_INSTALLATION_ID"
+_MCP_INSTALLATION_ID_FILE_ENV = "ORACLE_MCP_INSTALLATION_ID_FILE"
+_MCP_INSTALLATION_ID_LENGTH = 8
+_MCP_ACTOR_ID_LENGTH = 6
+_MCP_REQUEST_ID_LENGTH = 6
+_MCP_ACTOR_ID_CONTEXT: ContextVar[str] = ContextVar("mcp_actor_id", default="unknown")
+_MCP_TOOL_ID_CONTEXT: ContextVar[str] = ContextVar("mcp_tool_id", default="unknown")
+# Used only when a request is made outside an active FastMCP session. It is not
+# persisted, so it cannot identify a person across server restarts.
+_MCP_SERVER_INSTANCE_ID = uuid.uuid4().hex
+_MCP_TOOL_CODES = {
+    "list_protected_databases": "lpd",
+    "get_protected_database": "gpd",
+    "summarize_protected_database_health": "pdh",
+    "summarize_protected_database_redo_status": "pdr",
+    "summarize_backup_space_used": "bsu",
+    "check_recovery_service_limits": "rsl",
+    "fetch_regions_subscribed": "frs",
+    "list_protection_policies": "lpp",
+    "get_protection_policy": "gpp",
+    "list_recovery_service_subnets": "lrs",
+    "get_recovery_service_subnet": "grs",
+    "get_recovery_service_metrics": "rmt",
+    "list_databases": "ldb",
+    "get_database": "gdb",
+    "list_restore": "lwr",
+    "list_backups": "lbk",
+    "get_backup": "gbk",
+    "summarize_protected_database_backup_destination": "pbd",
+    "list_db_homes": "ldh",
+    "get_db_home": "gdh",
+    "list_db_systems": "lds",
+    "get_db_system": "gds",
+}
+
+
+def _marker_fragment(value: str, length: int) -> str:
+    """Return a fixed-width, lowercase base-36 pseudonym for an internal value."""
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    number = int.from_bytes(hashlib.sha256(value.encode()).digest(), "big")
+    chars: list[str] = []
+    for _ in range(length):
+        number, remainder = divmod(number, len(alphabet))
+        chars.append(alphabet[remainder])
+    return "".join(reversed(chars))
+
+
+def _installation_id_file() -> Path:
+    """Return the per-installation ID file, overridable for managed deployments."""
+    configured = (os.getenv(_MCP_INSTALLATION_ID_FILE_ENV) or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".oci-recovery-mcp" / "installation-id"
+
+
+def _mcp_installation_id() -> str:
+    """Return a durable opaque ID for this local install or hosted deployment."""
+    configured = (os.getenv(_MCP_INSTALLATION_ID_ENV) or "").strip()
+    if configured:
+        return _marker_fragment(configured, _MCP_INSTALLATION_ID_LENGTH)
+
+    id_file = _installation_id_file()
+    try:
+        persisted = id_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        persisted = ""
+    if persisted:
+        return _marker_fragment(persisted, _MCP_INSTALLATION_ID_LENGTH)
+
+    generated = uuid.uuid4().hex
+    try:
+        id_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(id_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(f"{generated}\n")
+    except FileExistsError:
+        try:
+            generated = id_file.read_text(encoding="utf-8").strip() or generated
+        except OSError:
+            pass
+    except OSError:
+        # An unwritable home/state directory must not stop a tool call. This
+        # fallback remains stable for the current server process only.
+        generated = _MCP_SERVER_INSTANCE_ID
+    return _marker_fragment(generated, _MCP_INSTALLATION_ID_LENGTH)
+
+
+def _mcp_actor_id() -> str:
+    """Return a privacy-safe opaque identifier for the active MCP user/session."""
+    principal = None
+    scope = None
+    access_token = _current_access_token()
+    if access_token is not None:
+        claims = getattr(access_token, "claims", None) or {}
+        # Some OAuth providers omit sub from the access token. The token jti
+        # still provides an opaque, authenticated session identifier.
+        principal = claims.get("sub") or claims.get("jti")
+        # The issuer identifies the IAM domain this deployment authenticates
+        # against, which scopes the pseudonym without naming the user.
+        scope = claims.get("iss")
+
+    if not principal:
+        # For session/API-key deployments, OCI credentials identify the server
+        # account, not the MCP caller. Prefer FastMCP's per-client session so
+        # users sharing one configured server remain distinguishable.
+        try:
+            from fastmcp.server.dependencies import get_context
+
+            principal = get_context().session_id
+            scope = scope or "mcp-session"
+        except Exception:
+            principal = None
+
+    if not principal:
+        # Direct SDK use can occur outside a FastMCP request context. Retain a
+        # stable server-account pseudonym when a local OCI config is available.
+        try:
+            config = _load_oci_config_for_server()
+            principal = config.get("user")
+            scope = scope or config.get("tenancy")
+        except Exception:
+            principal = _MCP_SERVER_INSTANCE_ID
+            scope = "mcp-server"
+    return _marker_fragment(f"{scope or ''}:{principal}", _MCP_ACTOR_ID_LENGTH)
+
+
+def _mcp_opc_request_id(value: Optional[str]) -> str:
+    """Return a 32-character OCI request ID with MCP telemetry markers.
+
+    OCI services preserve only the first 32 characters before appending their
+    own request-id segments. Keep all telemetry fields inside that prefix.
+    """
+    request_id = str(value or uuid.uuid4().hex)
+    if re.fullmatch(r"rcvmcp-[0-9a-z]{8}-[0-9a-z]{6}-[0-9a-z]{3}[0-9a-z]{6}", request_id):
+        return request_id
+    installation_id = _mcp_installation_id()
+    actor_id = _MCP_ACTOR_ID_CONTEXT.get()[:_MCP_ACTOR_ID_LENGTH].ljust(_MCP_ACTOR_ID_LENGTH, "0")
+    tool_code = _MCP_TOOL_CODES.get(_MCP_TOOL_ID_CONTEXT.get(), "unk")
+    request_code = _marker_fragment(request_id, _MCP_REQUEST_ID_LENGTH)
+    return f"{_MCP_OPC_REQUEST_ID_PREFIX}-{installation_id}-{actor_id}-{tool_code}{request_code}"
+
+
+def _operation_supports_opc_request_id(operation: Callable[..., Any]) -> bool:
+    """Return whether an OCI SDK operation accepts ``opc_request_id``."""
+    try:
+        return '"opc_request_id"' in inspect.getsource(operation)
+    except (OSError, TypeError):
+        return False
+
+
+def _install_opc_request_id_fallback(client: Any, request_id: str) -> None:
+    """Mark generated OCI SDK calls that do not expose an ``opc_request_id`` kwarg."""
+    base_client = getattr(client, "base_client", None)
+    call_api = getattr(base_client, "call_api", None)
+    if base_client is None or not callable(call_api):
+        return
+
+    marker = _mcp_opc_request_id(request_id)
+
+    def _call_api(*args, **kwargs):
+        # Generated OCI operations pass header_params to BaseClient.call_api. Adding
+        # the header here avoids unsupported operation kwargs and does not enable
+        # the SDK's process-wide request-id propagation state.
+        call_kwargs = dict(kwargs)
+        headers = dict(call_kwargs.get("header_params") or {})
+        headers["opc-request-id"] = _mcp_opc_request_id(headers.get("opc-request-id") or marker)
+        call_kwargs["header_params"] = headers
+        return call_api(*args, **call_kwargs)
+
+    base_client.call_api = _call_api
+
+
 def _wrap_oci_client(client: Any, *, request_id: str, client_name: str):
-    """Proxy that logs every SDK method call + response summary, without changing behavior."""
+    """Proxy that marks and logs every OCI SDK method call and response summary."""
+    _install_opc_request_id_fallback(client, request_id)
 
     class _Proxy:
         def __init__(self, inner: Any):
             self._inner = inner
+            self._opc_request_id_support: dict[str, bool] = {}
 
         def __getattr__(self, name: str):
             attr = getattr(self._inner, name)
             if not callable(attr):
                 return attr
+            if name not in self._opc_request_id_support:
+                self._opc_request_id_support[name] = _operation_supports_opc_request_id(
+                    getattr(attr, "__func__", attr)
+                )
+            supports_opc_request_id = self._opc_request_id_support[name]
 
             def _call(*args, **kwargs):
+                kwargs = dict(kwargs)
+                if supports_opc_request_id:
+                    kwargs["opc_request_id"] = _mcp_opc_request_id(kwargs.get("opc_request_id") or request_id)
                 start = time.time()
                 _log_event(
                     "oci_call",
@@ -539,6 +589,8 @@ def _tool_logger(tool_name: str):
         def _wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
             request_id = uuid.uuid4().hex
             start = time.time()
+            actor_id_token = _MCP_ACTOR_ID_CONTEXT.set(_mcp_actor_id())
+            tool_id_token = _MCP_TOOL_ID_CONTEXT.set(tool_name)
             _log_event(
                 "tool_call",
                 request_id=request_id,
@@ -575,6 +627,9 @@ def _tool_logger(tool_name: str):
                     level=logging.ERROR,
                 )
                 raise
+            finally:
+                _MCP_TOOL_ID_CONTEXT.reset(tool_id_token)
+                _MCP_ACTOR_ID_CONTEXT.reset(actor_id_token)
 
         return _wrapped
 
@@ -583,216 +638,414 @@ def _tool_logger(tool_name: str):
 
 # Auth/Config
 
+_USER_AGENT_NAME = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
+_ADDITIONAL_UA = f"{_USER_AGENT_NAME}/{__version__}"
 
-def _effective_auth_method() -> Literal["session", "apikey"]:
+
+def _legacy_auth_type_override() -> Optional[AuthType]:
+    """Translate the one 2.x ORACLE_MCP_AUTH_METHOD spelling the shared library rejects.
+
+    oracle-mcp-common already reads ORACLE_MCP_AUTH_METHOD itself and maps
+    "session"/"api_key"/"api-key" onto its own auth types, so this server does not
+    need to interpret them. Its normalizer does not recognize the unseparated
+    "apikey" spelling that this server's 2.x README documented, though, and an
+    unrecognized value is a hard error -- so translate only that case.
+
+    Everything else is left to resolve_auth_type(), including an unset value, which
+    selects "auto": session-token when the profile directly declares a
+    security_token_file, otherwise API-key. Forcing a type here instead would break
+    that detection -- an API-key-only profile would be rejected for having no
+    security_token_file.
     """
-    Auth selection is done strictly via environment variables (set by the MCP host).
-
-    Required:
-      - ORACLE_MCP_AUTH_METHOD: "session" or "apikey"
-
-    Optional:
-      - ORACLE_MCP_AUTH_PROFILE: OCI config profile name (defaults to OCI_CONFIG_PROFILE/DEFAULT)
-    """
-    m = (os.getenv("ORACLE_MCP_AUTH_METHOD") or "session").strip().lower()
-    if m in ("apikey", "api_key", "api-key"):
-        return "apikey"
-    return "session"
+    raw = (os.getenv("ORACLE_MCP_AUTH_METHOD") or "").strip().lower()
+    if raw == "apikey":
+        return AuthType.API_KEY
+    return None
 
 
-def _effective_profile_name() -> str:
-    prof = (os.getenv("ORACLE_MCP_AUTH_PROFILE") or "").strip()
-    if prof:
-        return prof
-    return os.getenv("OCI_CONFIG_PROFILE", oci.config.DEFAULT_PROFILE)
+def _resolved_auth_type_label() -> str:
+    """The auth type the shared library will use, for the startup log line only."""
+    try:
+        override = _legacy_auth_type_override()
+        return (override or resolve_auth_type()).value
+    except Exception:
+        return "unresolved"
+
+
+def _first_env(*names: str, default: Optional[str] = None) -> Optional[str]:
+    """Return the first non-empty environment variable among names."""
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and v.strip() != "":
+            return v.strip()
+    return default
 
 
 def _load_oci_config_for_server() -> dict:
-    config = oci.config.from_file(profile_name=_effective_profile_name())
-    user_agent_name = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
-    config["additional_user_agent"] = f"{user_agent_name}/{__version__}"
+    """Read the selected profile's raw OCI config (for informational lookups only,
+    e.g. actor-id logging and tenancy discovery). Client construction uses
+    oracle_mcp_common.build_auth_context() instead; see _build_profile_auth_context().
+
+    The config file is resolved through oracle_mcp_common.resolve_config_file() so
+    these lookups read the same file the credentials came from. The OCI SDK only
+    consults OCI_CONFIG_FILE when ~/.oci/config is absent, so reading the file
+    directly would resolve the tenancy and region from a different profile than
+    the signer whenever both exist.
+    """
+    config = oci.config.from_file(
+        file_location=resolve_config_file(),
+        profile_name=resolve_profile_name(),
+    )
+    config["additional_user_agent"] = _ADDITIONAL_UA
     return config
 
 
-def _get_profile_value(key: str):
-    parser = configparser.ConfigParser()
-    parser.read(os.path.expanduser(os.getenv("OCI_CONFIG_FILE", oci.config.DEFAULT_LOCATION)))
-    profile = _effective_profile_name()
-    return (parser[profile].get(key) if profile in parser else None) or parser.defaults().get(key)
+def _build_profile_auth_context():
+    """Resolve stdio OCI credentials through the shared oracle-mcp-common library.
+
+    The library owns auth-type and profile resolution, including this server's
+    ORACLE_MCP_AUTH_METHOD/ORACLE_MCP_AUTH_PROFILE variables, so nothing is passed
+    unless the legacy "apikey" spelling needs translating (see
+    _legacy_auth_type_override).
+    """
+    override = _legacy_auth_type_override()
+    if override is not None:
+        return build_auth_context(AuthOptions(auth_type=override))
+    return build_auth_context()
 
 
-def _get_http_config_and_signer(region: str | None = None):
-    if not (os.getenv("ORACLE_MCP_HOST") and os.getenv("ORACLE_MCP_PORT")):
-        return None, None
-    token = get_access_token()
-    if token is None:
-        raise RuntimeError("HTTP requests require an authenticated IDCS access token.")
-    domain = os.getenv("IDCS_DOMAIN")
-    client_id = os.getenv("IDCS_CLIENT_ID")
-    client_secret = os.getenv("IDCS_CLIENT_SECRET")
-    if not all((domain, client_id, client_secret)):
+# ---------------- HTTP transport auth (OCI IAM / IDCS) ----------------
+#
+# Transport decides the credential path, exactly as in the other OCI MCP servers:
+#
+#   * stdio  -- the operator's own OCI credentials, resolved by
+#               oracle_mcp_common.build_auth_context() from the selected profile.
+#   * HTTP   -- each caller signs in to an OCI IAM (IDCS) domain, and that caller's
+#               access token is exchanged for caller-specific OCI credentials by
+#               oracle_mcp_common.IDCSHttpAuth.context_for().
+#
+# The policy (provider + the confidential application's credentials) is built once
+# in main() when ORACLE_MCP_HOST/ORACLE_MCP_PORT select the HTTP listener. A fresh
+# signer is built for every tool call: it carries the caller's own IAM domain JWT,
+# so nothing is cached process-wide outside the request that established it.
+
+_OAUTH_SCOPE_SUFFIX = __project__.removeprefix("oracle.oci-").removesuffix("-mcp-server").replace("-", "_")
+_DEFAULT_REQUIRED_SCOPES = f"openid profile email oci_mcp.{_OAUTH_SCOPE_SUFFIX}.invoke".split()
+
+# Scopes IDCS defines itself, which are never namespaced by a resource application.
+# Everything else in IDCS_REQUIRED_SCOPES belongs to this server's resource
+# application and must be qualified with that application's primary audience.
+_IDCS_RESERVED_SCOPES = frozenset(
+    {"openid", "profile", "email", "address", "phone", "groups", "offline_access"}
+)
+
+_http_auth: Optional[IDCSHttpAuth] = None
+
+
+def _required_scopes() -> list[str]:
+    """The scopes required of every authenticated caller over HTTP."""
+    return parse_scopes(os.getenv("IDCS_REQUIRED_SCOPES")) or list(_DEFAULT_REQUIRED_SCOPES)
+
+
+def _qualify(audience: str, scopes: list[str]) -> list[str]:
+    """Name each resource scope the way IDCS does: audience + scope, no separator."""
+    return [
+        s if (s in _IDCS_RESERVED_SCOPES or "://" in s) else f"{audience}{s}"
+        for s in scopes
+    ]
+
+
+def _qualify_upstream_scopes(provider, *, audience: str, scopes: list[str]) -> list[str]:
+    """Request resource scopes from IDCS in the fully-qualified form it requires.
+
+    IDCS names a resource application's scopes by concatenating the application's
+    primary audience with the scope, without a separator. `/authorize` only
+    recognizes that form, so a bare `oci_mcp.recovery.invoke` is rejected with
+    `invalid_scope` and sign-in never completes.
+
+    The access token IDCS issues, however, carries the scope *bare* in its `scope`
+    claim, with the audience in `aud`. That token is what gets re-validated on every
+    request (OAuthProxy.load_access_token swaps the FastMCP JWT for it), and the
+    verifier requires `required_scopes` to be a subset of that claim. So the same
+    setting is needed in two incompatible forms: qualified going out, bare coming
+    back. Configuring either one alone breaks the other half of the flow.
+
+    We therefore keep the verifier's `required_scopes` bare -- it is what
+    verification and the bearer-scope check compare against -- and qualify only the
+    scopes advertised to clients, which is what a client requests and what the
+    upstream authorize URL is built from. Reserved OIDC scopes and anything already
+    absolute are left alone.
+
+    Three separate places build an upstream request, and each reads the scopes from
+    somewhere different, so all three have to be qualified:
+
+      * `update_default_scopes` covers DCR registration defaults, `valid_scopes`,
+        and the metadata clients read to decide what to request.
+      * `required_scopes` on the *proxy* is what `_build_upstream_authorize_url`
+        falls back to when the client sends no `scope` parameter at all -- which
+        clients do, and which no amount of correct advertising prevents. This is
+        safe to overwrite because the proxy's own `required_scopes` is read *only*
+        there; scope verification compares against `token_verifier.required_scopes`,
+        a different object that stays bare.
+      * `_prepare_scopes_for_upstream_refresh` builds the refresh request from the
+        scopes stored on the refresh token, and those were parsed from the IDCS
+        token response -- so they are bare. Left alone, sign-in succeeds and then
+        the session dies at the first refresh, an hour later, with the same
+        `invalid_scope` far from any change that would explain it.
+
+    FastMCP's own AzureProvider solves the same audience-qualification problem the
+    same way, which is why these are the hooks that exist to override.
+    """
+    for attr in (
+        "update_default_scopes",
+        "required_scopes",
+        "_prepare_scopes_for_upstream_refresh",
+    ):
+        if not hasattr(provider, attr):
+            raise RuntimeError(
+                f"This FastMCP release does not expose '{attr}', so the resource scopes "
+                "cannot be qualified with the IAM resource application's audience and "
+                "IDCS would reject sign-in with 'invalid_scope'."
+            )
+
+    if getattr(provider, "_verify_id_token", False) is True:
+        # OIDCProxy strips scopes off the verifier when it validates the id_token
+        # instead of the access token, and moves enforcement onto the provider's
+        # own required_scopes -- the field qualified just below. Under that mode
+        # the two uses collide again and qualifying would reject every request,
+        # so refuse rather than reintroduce the 401 loop silently.
         raise RuntimeError(
-            "HTTP requests require IDCS authentication. Set IDCS_DOMAIN, IDCS_CLIENT_ID, and IDCS_CLIENT_SECRET."
+            "This provider verifies the id_token, which makes 'required_scopes' the "
+            "scope-enforcement point as well as the upstream authorize fallback. Those "
+            "need opposite forms, so the resource scopes cannot be qualified safely."
         )
-    base_region = region or os.getenv("OCI_REGION")
-    if not base_region:
-        raise RuntimeError("HTTP requests require OCI_REGION.")
-    user_agent_name = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
-    config = {"region": base_region, "additional_user_agent": f"{user_agent_name}/{__version__}"}
-    return config, oci.auth.signers.TokenExchangeSigner(
-        token.token,
-        f"https://{domain}",
-        client_id,
-        client_secret,
-        region=config.get("region"),
+
+    qualified = _qualify(audience, scopes)
+    provider.update_default_scopes(qualified)
+    provider.required_scopes = qualified
+    # Falls back to the configured scopes when a refresh token carries none,
+    # mirroring what the authorize path does with an empty transaction.
+    provider._prepare_scopes_for_upstream_refresh = (
+        lambda stored, _aud=audience, _default=qualified: _qualify(
+            _aud, list(stored) or list(_default)
+        )
     )
+    return qualified
 
 
-def _build_signer_for_session(config: dict):
-    private_key = oci.signer.load_private_key_from_file(config["key_file"])
-    token_file = config["security_token_file"]
-    with open(token_file, "r", encoding="utf-8") as f:
-        token = f.read()
-    return oci.auth.signers.SecurityTokenSigner(token, private_key)
+def _disable_cimd(provider) -> None:
+    """Turn off CIMD client registration on the OAuth provider.
+
+    CIMD (Client ID Metadata Document) lets a client present an HTTPS URL as its
+    `client_id`, which the server then fetches to learn that client's metadata.
+    FastMCP enables it by default, but the fetch is an outbound internet request
+    made from this process with pinned DNS and redirects disabled -- so it fails
+    on exactly the deployment this server is built for: a VM reachable only over
+    a VPN, whose egress is either absent or through a CONNECT proxy that a
+    pinned-DNS request cannot traverse. The failure surfaces to the user as
+    "The client ID ... was not found in the server's client registry", which
+    reads like a client bug rather than the network problem it is.
+
+    Clearing the manager both stops that lookup and stops advertising
+    `client_id_metadata_document_supported` in the authorization-server metadata,
+    so clients register with DCR against `/register` instead -- an exchange that
+    never leaves this host and works on every deployment.
+
+    `_cimd_manager` is private FastMCP API and there is no public alternative:
+    OCIProvider does not forward `enable_cimd` to the underlying proxy. The
+    attribute is therefore checked rather than assumed, so an upstream rename
+    fails at startup instead of silently restoring the outbound fetch.
+    """
+    if not hasattr(provider, "_cimd_manager"):
+        raise RuntimeError(
+            "This FastMCP release does not expose '_cimd_manager', so CIMD client "
+            "registration cannot be disabled and client registration would depend on "
+            "this host being able to fetch the client's metadata URL. Check whether "
+            "OCIProvider now accepts enable_cimd=False and use that instead."
+        )
+    provider._cimd_manager = None
 
 
-def _get_oci_client_kwargs(signer=None):
-    kwargs = {
-        "circuit_breaker_strategy": oci.circuit_breaker.CircuitBreakerStrategy(
-            failure_threshold=int(os.getenv("OCI_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "10")),
-            recovery_timeout=int(os.getenv("OCI_CIRCUIT_BREAKER_RECOVERY_TIMEOUT", "30")),
-        ),
-        "circuit_breaker_callback": lambda exc: logger.warning(
-            "Circuit breaker triggered: %s", exc
-        ),
-    }
-    if signer is not None:
-        kwargs["signer"] = signer
-    return kwargs
+def _build_http_auth() -> IDCSHttpAuth:
+    """Build the HTTP IDCS policy and apply the two settings the shared builder omits."""
+    scopes = _required_scopes()
+    auth = build_idcs_http_auth(scopes)
+    audience = os.getenv("IDCS_AUDIENCE") or ""
+    _qualify_upstream_scopes(auth.provider, audience=audience, scopes=scopes)
+    _disable_cimd(auth.provider)
+    return auth
 
 
-# Create the FastMCP app that exposes the functions decorated with @mcp.tool
+def _current_access_token():
+    """The authenticated caller's IDCS token, or None outside an HTTP request."""
+    try:
+        return get_access_token()
+    except Exception:
+        return None
+
+
+def _serving_http() -> bool:
+    """Whether this call arrived over the authenticated HTTP transport."""
+    if _current_access_token() is not None:
+        return True
+    try:
+        get_http_request()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _http_config_and_signer(region: str | None = None):
+    """Resolve request-scoped OCI credentials for the current caller.
+
+    The IAM domain JWT is taken from the active request's access token and passed
+    to IDCSHttpAuth.context_for(), which returns a signer built for this request
+    only: it is never stored outside the request that established the caller's
+    identity, so a signer built for one caller can never be reused for another.
+    """
+    if _http_auth is None:
+        raise RuntimeError(
+            "HTTP authentication policy has not been initialized. Start the server "
+            "through main() with ORACLE_MCP_HOST/ORACLE_MCP_PORT set."
+        )
+    access_token = _current_access_token()
+    try:
+        request_auth = _http_auth.context_for(
+            access_token.token if access_token else None, region=region
+        )
+    except Exception as e:
+        # Surface the IAM domain's actual error body instead of a bare
+        # "401 Unauthorized". A 401/403 here almost always means the OCI side is
+        # not set up to exchange the user JWT for a UPST yet: a missing or
+        # misconfigured Identity Propagation Trust, the confidential app missing
+        # the token-exchange/client-credentials grant, or wrong client credentials.
+        # The IAM error body is a diagnostic description and contains no secrets.
+        # context_for() wraps SDK failures in ValueError, so the IAM response hangs
+        # off the wrapped cause.
+        resp = getattr(e, "response", None) or getattr(getattr(e, "__cause__", None), "response", None)
+        detail = ""
+        if resp is not None:
+            try:
+                detail = f" | IAM {resp.status_code}: {resp.text}"
+            except Exception:
+                pass
+        logger.error("OCI UPST token exchange failed%s", detail, exc_info=True)
+        raise RuntimeError(
+            "OCI UPST token exchange failed. The OCI IAM domain rejected the request to "
+            "exchange the user's token for a UPST. Verify, in this deployment's IAM domain: "
+            "(1) an Identity Propagation Trust exists that lists this client_id; (2) the "
+            "confidential app has the Authorization Code and Client Credentials grants; "
+            "(3) IDCS_CLIENT_ID/IDCS_CLIENT_SECRET are correct." + detail
+        ) from e
+    config = {**request_auth.config, "additional_user_agent": _ADDITIONAL_UA}
+    return config, request_auth.signer
+
+
+def _config_and_signer(region: str | None = None):
+    """Resolve OCI SDK configuration and a signer for the current call."""
+    if _serving_http():
+        return _http_config_and_signer(region)
+    auth_context = _build_profile_auth_context()
+    config = {**auth_context.config, "additional_user_agent": _ADDITIONAL_UA}
+    if region is not None:
+        config["region"] = region
+    return config, auth_context.signer
+
+
+def _effective_region(default: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the OCI region without requiring a local config file.
+
+    Over HTTP there is no OCI config file to read, so OCI_REGION supplies the
+    default region; over stdio it is the configured profile's region.
+    """
+    if _serving_http():
+        return _first_env("OCI_REGION", "ORACLE_MCP_REGION", default=default)
+    try:
+        return _load_oci_config_for_server().get("region") or default
+    except Exception:
+        return _first_env("OCI_REGION", "ORACLE_MCP_REGION", default=default)
+
+
+def _make_client(
+    ctor: Callable[..., Any],
+    region: str | None = None,
+    *,
+    client_name: str,
+    request_id: Optional[str] = None,
+):
+    """Construct and wrap an OCI SDK client for the current call's credentials."""
+    config, signer = _config_and_signer(region)
+    client = ctor(config, signer=signer)
+    rid = request_id or uuid.uuid4().hex
+    return _wrap_oci_client(client, request_id=rid, client_name=client_name)
+
+
+# Create the FastMCP app that exposes the functions decorated with @mcp.tool.
+# main() attaches the OCI IAM OAuth provider when it selects the HTTP transport.
 mcp = FastMCP(name=__project__)
+
+
 def get_recovery_client(
     region: str | None = None,
     *,
     request_id: Optional[str] = None,
 ) -> oci.recovery.DatabaseRecoveryClient:
     """Create a Recovery Service client using auth selected via env vars."""
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.recovery.DatabaseRecoveryClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.recovery.DatabaseRecoveryClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.recovery.DatabaseRecoveryClient(
-            regional_config, **_get_oci_client_kwargs(signer)
-        )
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="recovery")
+    return _make_client(
+        oci.recovery.DatabaseRecoveryClient,
+        region,
+        client_name="recovery",
+        request_id=request_id,
+    )
 
 
 def get_identity_client(*, request_id: Optional[str] = None):
-    config, signer = _get_http_config_and_signer()
-    if signer is None:
-        config = _load_oci_config_for_server()
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.identity.IdentityClient(config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.identity.IdentityClient(config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(config)
-        client = oci.identity.IdentityClient(config, **_get_oci_client_kwargs(signer))
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="identity")
+    return _make_client(
+        oci.identity.IdentityClient,
+        None,
+        client_name="identity",
+        request_id=request_id,
+    )
 
 
-def get_database_client(region: str = None, *, request_id: Optional[str] = None):
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.database.DatabaseClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.database.DatabaseClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.database.DatabaseClient(regional_config, **_get_oci_client_kwargs(signer))
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="database")
+def get_database_client(region: str | None = None, *, request_id: Optional[str] = None):
+    return _make_client(
+        oci.database.DatabaseClient,
+        region,
+        client_name="database",
+        request_id=request_id,
+    )
 
 
 def get_work_request_client(region: str | None = None, *, request_id: Optional[str] = None):
     """Create an OCI Work Requests client using auth selected via env vars."""
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.work_requests.WorkRequestClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.work_requests.WorkRequestClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.work_requests.WorkRequestClient(
-            regional_config, **_get_oci_client_kwargs(signer)
-        )
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="work_requests")
+    return _make_client(
+        oci.work_requests.WorkRequestClient,
+        region,
+        client_name="work_requests",
+        request_id=request_id,
+    )
 
 
 def get_monitoring_client(region: str | None = None, *, request_id: Optional[str] = None):
     logger.info("entering get_monitoring_client")
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.monitoring.MonitoringClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.monitoring.MonitoringClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.monitoring.MonitoringClient(
-            regional_config, **_get_oci_client_kwargs(signer)
-        )
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="monitoring")
+    return _make_client(
+        oci.monitoring.MonitoringClient,
+        region,
+        client_name="monitoring",
+        request_id=request_id,
+    )
 
 
 def get_limits_client(region: str | None = None, *, request_id: Optional[str] = None):
     """Create an OCI Limits client using auth selected via env vars."""
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.limits.LimitsClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.limits.LimitsClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.limits.LimitsClient(regional_config, **_get_oci_client_kwargs(signer))
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="limits")
+    return _make_client(
+        oci.limits.LimitsClient,
+        region,
+        client_name="limits",
+        request_id=request_id,
+    )
 
 
 def get_onesubscription_client(region: str | None = None, *, request_id: Optional[str] = None):
@@ -802,29 +1055,70 @@ def get_onesubscription_client(region: str | None = None, *, request_id: Optiona
     We use this to discover which regions a tenancy is subscribed to for a given service,
     so we can execute compartment-scoped queries across all relevant regions.
     """
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.onesubscription.SubscribedServiceClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.onesubscription.SubscribedServiceClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.onesubscription.SubscribedServiceClient(
-            regional_config, **_get_oci_client_kwargs(signer)
-        )
+    return _make_client(
+        oci.onesubscription.SubscribedServiceClient,
+        region,
+        client_name="onesubscription",
+        request_id=request_id,
+    )
 
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="onesubscription")
+
+# ---------------- Subscribed regions helpers ----------------
+
+def _tenant_cache_key() -> str:
+    """
+    Stable per-tenant key for the in-process caches.
+
+    Every in-process cache is partitioned by tenant so a cached result can never
+    outlive the tenancy it was computed for -- including across a configuration
+    change that repoints the server at a different tenancy. get_tenancy() returns
+    the configured tenancy OCID over HTTP, or the local config's over stdio.
+    """
+    try:
+        return get_tenancy() or "_default"
+    except Exception:
+        return "_default"
+
+
+def _caller_cache_key() -> str:
+    """
+    Stable per-caller key for caches whose contents depend on the caller's own
+    OCI permissions, appended to the tenant key.
+
+    Tenant partitioning alone is not enough for those: over HTTP every caller has
+    their own IAM permissions, so a result computed with one caller's
+    authorizations (anything fetched with access_level="ACCESSIBLE") must never be
+    served to another. Over stdio there is exactly one set of credentials for the
+    whole process, so there is nothing to separate and this contributes nothing to
+    the key.
+
+    The subject claim identifies the human, not the session, so the cache still
+    survives a token refresh. When the provider omits it we fall back to
+    per-session values (jti, then the raw token), which costs a refetch after a
+    refresh but never merges two callers. The key is hashed because it is cheap
+    to end up in a log line or a debug dump.
+    """
+    if not _serving_http():
+        return ""
+    try:
+        access = _current_access_token()
+        claims = (getattr(access, "claims", None) or {}) if access is not None else {}
+        # Only ever caller-specific values here. client_id identifies the
+        # registered OAuth application, which many humans share, so it must
+        # never appear in this chain. Some providers omit sub; jti and the raw
+        # token are both per-session, so the entry is scoped to this session.
+        subject = claims.get("sub") or claims.get("jti") or getattr(access, "token", None)
+    except Exception:
+        subject = None
+    if not subject:
+        # No request context at all (e.g. startup): don't touch a shared entry.
+        return f"anon:{uuid.uuid4().hex}"
+    return "sub:" + hashlib.sha256(str(subject).encode()).hexdigest()[:16]
 
 
 _REGION_CACHE: dict[str, Any] = {
-    "fetched_at": 0.0,
     "ttl_seconds": int(os.getenv("ORACLE_MCP_REGION_CACHE_TTL_SECONDS", "3600")),
-    # items: dict[cache_key -> list[str]]
+    # items: dict[tenant_key -> {"regions": list[dict], "fetched_at": float}]
     "items": {},
 }
 
@@ -834,19 +1128,19 @@ def _iam_subscribed_regions_with_status(*, request_id: str) -> list[dict]:
     Returns the tenancy's subscribed regions from IAM (IdentityClient.list_region_subscriptions).
     Output items are: {"region": "<region_name>", "status": "<READY|...>"}.
 
-    Cached in-process for ORACLE_MCP_REGION_CACHE_TTL_SECONDS to avoid repeated IAM calls.
+    Cached in-process for ORACLE_MCP_REGION_CACHE_TTL_SECONDS, partitioned per tenant.
     """
     now = time.time()
     ttl = float(_REGION_CACHE.get("ttl_seconds") or 3600)
-    items = _REGION_CACHE.get("items") or {}
+    items = _REGION_CACHE.setdefault("items", {})
 
-    cache_key = "iam:list_region_subscriptions"
-    fetched_at = float(_REGION_CACHE.get("fetched_at") or 0.0)
-    if cache_key in items and (now - fetched_at) < ttl:
-        return items.get(cache_key) or []
+    tenancy_id = get_tenancy()
+    cache_key = f"iam:list_region_subscriptions:{tenancy_id}"
+    cached = items.get(cache_key)
+    if cached and (now - float(cached.get("fetched_at") or 0.0)) < ttl:
+        return cached.get("regions") or []
 
     identity = get_identity_client(request_id=request_id)
-    tenancy_id = get_tenancy()
     resp = identity.list_region_subscriptions(tenancy_id=tenancy_id)
     subs = getattr(resp, "data", None) or []
 
@@ -858,18 +1152,24 @@ def _iam_subscribed_regions_with_status(*, request_id: str) -> list[dict]:
             out.append({"region": region_name, "status": status})
 
     out = sorted(out, key=lambda x: x.get("region") or "")
-    items[cache_key] = out
-    _REGION_CACHE["items"] = items
-    _REGION_CACHE["fetched_at"] = now
+    items[cache_key] = {"regions": out, "fetched_at": now}
     return out
 
 
 def get_tenancy():
-    # Return the tenancy OCID from config unless overridden by TENANCY_ID_OVERRIDE
-    tenancy_id = os.getenv("TENANCY_ID_OVERRIDE") or _get_profile_value("tenancy")
-    if not tenancy_id:
-        raise RuntimeError("Tenancy lookup requires TENANCY_ID_OVERRIDE or an OCI config file tenancy.")
-    return tenancy_id
+    # An explicit override always wins. Over HTTP it is the only source: there is
+    # no local OCI config file on a hosted deployment to read a tenancy from.
+    override = _first_env("TENANCY_ID_OVERRIDE", "ORACLE_MCP_TENANCY_ID")
+    if override:
+        return override
+    if _serving_http():
+        raise RuntimeError(
+            "HTTP deployments must set ORACLE_MCP_TENANCY_ID (or TENANCY_ID_OVERRIDE) "
+            "to the OCID of the tenancy this server serves; there is no local OCI "
+            "config file to read it from."
+        )
+    config = _load_oci_config_for_server()
+    return config["tenancy"]
 
 
 def list_all_compartments_internal(only_one_page: bool, limit=100):
@@ -902,10 +1202,12 @@ def list_all_compartments_internal(only_one_page: bool, limit=100):
     return compartments
 
 
+# ---------------- Nested compartment helpers ----------------
+
 _COMPARTMENT_CACHE: dict[str, Any] = {
-    "fetched_at": 0.0,
     "ttl_seconds": int(os.getenv("ORACLE_MCP_COMPARTMENT_CACHE_TTL_SECONDS", "300")),
-    "items": None,  # type: ignore
+    # entries: dict["<tenant_key>|<caller_key>" -> {"items": list[Any], "fetched_at": float}]
+    "entries": {},
 }
 
 
@@ -913,6 +1215,11 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
     """
     Return all accessible ACTIVE compartments in the tenancy (plus root tenancy)
     with a small in-process TTL cache to avoid repeated Identity scans.
+
+    The cache is keyed by tenant AND caller: the listing is fetched with
+    access_level="ACCESSIBLE", so it contains exactly the compartments the calling
+    identity may see. Keying it by tenant alone would let one user's compartment
+    tree be served to a differently-authorized user in the same tenancy.
 
     NOTE:
     - OCI CLI `oci iam compartment list --compartment-id <root>` returns ONLY direct children.
@@ -922,11 +1229,12 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
     """
     now = time.time()
     ttl = float(_COMPARTMENT_CACHE.get("ttl_seconds") or 300)
-    items = _COMPARTMENT_CACHE.get("items")
-    fetched_at = float(_COMPARTMENT_CACHE.get("fetched_at") or 0.0)
+    entries = _COMPARTMENT_CACHE.setdefault("entries", {})
+    cache_key = f"{_tenant_cache_key()}|{_caller_cache_key()}"
+    cached = entries.get(cache_key)
 
-    if items and (now - fetched_at) < ttl:
-        return items  # type: ignore[return-value]
+    if cached and cached.get("items") and (now - float(cached.get("fetched_at") or 0.0)) < ttl:
+        return cached["items"]  # type: ignore[return-value]
 
     rid = request_id or uuid.uuid4().hex
 
@@ -971,8 +1279,7 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
         )
         comps = []
 
-    _COMPARTMENT_CACHE["items"] = comps
-    _COMPARTMENT_CACHE["fetched_at"] = now
+    entries[cache_key] = {"items": comps, "fetched_at": now}
     return comps
 
 
@@ -1368,12 +1675,13 @@ def get_compartment_by_name_tool(
 
 @mcp.tool(
     description=(
-        "Lists protected databases in a compartment with optional filters. The "
-        "compartment input may be either a compartment OCID or a compartment display "
-        "name. For each database it also includes Recovery Service Subnet details, "
-        "removes noisy fields, and adds basic per‑database metrics. The result is a "
-        "list of simple dictionaries, each with cleaned subnet information and a "
-        "small metrics map."
+        "Lists protected databases in a compartment with optional filters. For each "
+        "database it also includes Recovery Service Subnet details, removes noisy "
+        "fields, and adds basic per‑database metrics. It also includes "
+        "policyLockedDateTime so retention-lock status is clear (null means lock "
+        "is disabled for the attached protection policy; a timestamp means lock "
+        "is configured/effective). The result is a list of simple dictionaries, "
+        "each with cleaned subnet information and a small metrics map."
     )
 )
 @_tool_logger("list_protected_databases")
@@ -1776,9 +2084,8 @@ def get_protected_database(
 @mcp.tool(
     description=(
         "Shows how many protected databases are healthy, warning, alert, or unknown "
-        "in a compartment. The compartment input may be either a compartment OCID or "
-        "a compartment display name. If a quick list doesn’t include health, it checks "
-        "each database to fill it in. The result is a small JSON with the counts, the "
+        "in a compartment. If a quick list doesn’t include health, it checks each "
+        "database to fill it in. The result is a small JSON with the counts, the "
         "compartmentId, and the region."
     )
 )
@@ -1962,9 +2269,9 @@ def summarize_protected_database_health(
 
 @mcp.tool(
     description=(
-        "Shows how many protected databases have redo transport turned on or off in "
-        "a compartment. The compartment input may be either a compartment OCID or a "
-        "compartment display name. It reads the main setting and uses a fallback when "
+        "Use this tool for real-time protection status questions. It shows how many "
+        "protected databases have redo transport (real-time protection) turned on or "
+        "off in a compartment. It reads the main setting and uses a fallback when "
         "needed. The result is a simple JSON with enabled, disabled, total, the "
         "compartmentId, and the region."
     )
@@ -2131,10 +2438,9 @@ def summarize_protected_database_redo_status(
     description=(
         "Adds up the backup space (in GB) used by protected databases in a compartment, "
         "including only those with lifecycle state ACTIVE or DELETE_SCHEDULED (excluding "
-        "DELETED). The compartment input may be either a compartment OCID or a "
-        "compartment display name. It reads each database’s metrics and also tells you "
-        "how many databases were checked. The result is a small JSON with the "
-        "compartmentId, region, totalDatabasesScanned, and the total space in GB."
+        "DELETED). It reads each database’s metrics and also tells you how many databases "
+        "were checked. The result is a small JSON with the compartmentId, region, "
+        "totalDatabasesScanned, and the total space in GB."
     )
 )
 @_tool_logger("summarize_backup_space_used")
@@ -2364,9 +2670,8 @@ def check_recovery_service_limits(
     """
     try:
         request_id = uuid.uuid4().hex
-        config = _load_oci_config_for_server()
         resolved_compartment_id = get_tenancy()
-        target_region = (config.get("region") or "us-ashburn-1").strip()
+        target_region = (_effective_region("us-ashburn-1") or "us-ashburn-1").strip()
         client = get_limits_client(target_region, request_id=request_id)
 
         service_name = "autonomous-recovery-service"
@@ -2455,9 +2760,7 @@ def fetch_regions_subscribed(
 @mcp.tool(
     description=(
         "Lists protection policies in a compartment with handy filters and automatic "
-        "paging. The compartment input may be either a compartment OCID or a "
-        "compartment display name. The result is a straightforward list of "
-        "protection policies."
+        "paging. The result is a straightforward list of protection policies."
     )
 )
 @_tool_logger("list_protection_policies")
@@ -2588,11 +2891,10 @@ def get_protection_policy(
 
 @mcp.tool(
     description=(
-        "Lists recovery service subnets in a compartment with helpful filters. The "
-        "compartment input may be either a compartment OCID or a compartment display "
-        "name. When needed, it fills in the list of associated subnets or uses the "
-        "subnet_id as a fallback. The result is a simple list of subnets with the "
-        "subnets list included when available."
+        "Lists recovery service subnets in a compartment with helpful filters. When "
+        "needed, it fills in the list of associated subnets or uses the subnet_id as "
+        "a fallback. The result is a simple list of subnets with the subnets list "
+        "included when available."
     )
 )
 @_tool_logger("list_recovery_service_subnets")
@@ -2765,11 +3067,10 @@ def get_recovery_service_subnet(
 
 @mcp.tool(
     description=(
-        "Fetches Recovery Service metrics for a time range. The compartment input may "
-        "be either a compartment OCID or a compartment display name. You choose the "
-        "metric, time step, and how to combine values, and you can limit it to one "
-        "protected database. The result is a simple time series where each item has "
-        "dimensions and a list of {timestamp, value} points."
+        "Fetches Recovery Service metrics for a time range. You choose the metric, "
+        "time step, and how to combine values, and you can limit it to one protected "
+        "database. The result is a simple time series where each item has dimensions "
+        "and a list of {timestamp, value} points."
     )
 )
 @_tool_logger("get_recovery_service_metrics")
@@ -2855,11 +3156,10 @@ def get_recovery_service_metrics(
 @mcp.tool(
     description=(
         "Lists databases in a DB Home or, if none is given, across all DB Homes in a "
-        "compartment. The compartment input may be either a compartment OCID or a "
-        "compartment display name. It can find DB Homes for you, fills in backup "
-        "settings only when needed, and, where possible, links each database to its "
-        "protection policy. The result is a list of database summaries with optional "
-        "backup settings and protection policy ID."
+        "compartment. It can find DB Homes for you, fills in backup settings only when "
+        "needed, and, where possible, links each database to its protection policy. "
+        "The result is a list of database summaries with optional backup settings and "
+        "protection policy ID."
     )
 )
 @_tool_logger("list_databases")
@@ -3224,11 +3524,10 @@ def list_restore(
     description=(
         "Lists database backups with flexible filters and optional auto-paging. If "
         "database_id is provided, lists all backups for that database. If compartment_id "
-        "is provided, it may be either a compartment OCID or a compartment display name, "
-        "and the tool finds AVAILABLE databases with auto-backup enabled and lists "
-        "their backups. It includes manual backups, automatic backups and LTR backups "
-        "as well. It adds helpful fields like backup destination, database's unique "
-        "name. The result is a list of easy-to-read backup summaries."
+        "is provided, finds AVAILABLE databases with auto-backup enabled and lists their "
+        "backups. It includes manual backups, automatic backups and LTR backups as well. "
+        "It adds helpful fields like backup destination, database's unique name. The "
+        "result is a list of easy-to-read backup summaries."
     )
 )
 @_tool_logger("list_backups")
@@ -3636,12 +3935,11 @@ def get_backup(
 
 @mcp.tool(
     description=(
-        "Summarizes how databases in a compartment or DB Home are backed up. The "
-        "compartment input may be either a compartment OCID or a compartment display "
-        "name. It can find DB Homes, looks at each database’s backup settings, can "
-        "include the time of the most recent backup, and groups results by destination "
-        "type while calling out databases that aren’t configured. The result is one "
-        "summary object with counts, name lists, and per‑database details."
+        "Summarizes how databases in a compartment or DB Home are backed up. It can "
+        "find DB Homes, looks at each database’s backup settings, can include the time "
+        "of the most recent backup, and groups results by destination type while calling "
+        "out databases that aren’t configured. The result is one summary object with "
+        "counts, name lists, and per‑database details."
     )
 )
 @_tool_logger("summarize_protected_database_backup_destination")
@@ -4020,9 +4318,8 @@ def summarize_protected_database_backup_destination(
 @mcp.tool(
     description=(
         "Lists database homes in a compartment with optional lifecycle filters, "
-        "defaulting to your tenancy when no compartment is given. The compartment "
-        "input may be either a compartment OCID or a compartment display name. It "
-        "handles paging for you and returns a list of database home summaries."
+        "defaulting to your tenancy when no compartment is given, and handles paging "
+        "for you. The result is a list of database home summaries."
     )
 )
 @_tool_logger("list_db_homes")
@@ -4116,9 +4413,8 @@ def get_db_home(
 @mcp.tool(
     description=(
         "Lists database systems in a compartment with optional lifecycle filters, "
-        "defaulting to your tenancy when no compartment is given. The compartment "
-        "input may be either a compartment OCID or a compartment display name. It "
-        "handles paging for you and returns a list of database system summaries."
+        "defaulting to your tenancy when no compartment is given, and handles paging "
+        "for you. The result is a list of database system summaries."
     )
 )
 @_tool_logger("list_db_systems")
@@ -4207,16 +4503,40 @@ def get_db_system(
         raise
 
 
-@mcp.prompt(
-    name="oci_recovery_service_dashboard_prompt",
-    description="Returns the OCI Recovery Service Dashboard prompt.",
+@mcp.tool(
+    description=(
+        "Returns dashboard-generation guidance for OCI Recovery Service, including "
+        "cloud-protected databases."
+    )
 )
-def oci_recovery_service_dashboard_prompt():
-    return [{"role": "system", "content": OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT}]
+def oci_recovery_service_dashboard_prompt() -> str:
+    """Return dashboard-generation guidance as a tool for clients without prompt support."""
+    return OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT
+
+
+@mcp.tool(
+    description=(
+        "Always call this tool first when a user asks to onboard, protect, enable Recovery Service backups for, or register a database to Recovery Service. The tool first determines and verifies whether the target database is OCI DBaaS or purely on-premises, retrieves the latest Oracle requirements, and performs only the read-only prerequisite checks appropriate for that deployment type. For OCI DBaaS, it configures DBRS automatic backups using the current UpdateDatabase / DbBackupConfig contract, then independently verifies the protected database, assigned policy, health status, and initial backup. For on-premises databases, it proceeds with the Cloud Protect workflow only after the deployment type has been verified and the required approval has been obtained."
+    )
+)
+def onboard_database_to_recovery_service() -> str:
+    return ONBOARD_DATABASE_TO_RECOVERY_SERVICE_PROMPT
+
+
+@mcp.tool(
+    description=(
+        "Use this tool first whenever the user's underlying goal is to investigate, explain, or assess the health of Oracle Database backup, protection, or recoverability in an environment using Recovery Service. This includes explicit failures as well as implicit concerns such as unexpected backup behavior, stale or missing backups, protection lag, missing recovery points, restore/PITR problems, policy or retention behavior, RMAN issues, or questions about whether a protected database is healthy and recoverable. Also use it when the user asks whether anything is wrong with the protection environment, even without reporting an error. The tool provides an evidence-driven, access-first diagnostic workflow that traces the actual execution path, acquires relevant evidence, tests competing root-cause hypotheses, independently assesses recoverability, and guides safe remediation and verification. Do not use it for general database questions unrelated to backup, recovery, protection, or recoverability."
+    )
+)
+def diagnose_recovery_service_issue() -> str:
+    """Return Recovery Service diagnostic guidance as a tool for clients without prompt support."""
+    return DIAGNOSE_RECOVERY_SERVICE_ISSUE_PROMPT
 
 
 def main():
     # Entrypoint: choose transport based on env; always log startup meta and log file location
+    global _http_auth
+
     host = os.getenv("ORACLE_MCP_HOST")
     port = os.getenv("ORACLE_MCP_PORT")
 
@@ -4228,29 +4548,15 @@ def main():
     logger.info("Logs will be written to: %s", os.path.abspath(log_file))
 
     if not (host and port):
-        logger.info("Running FastMCP over stdio transport")
+        logger.info("Running FastMCP over stdio transport (auth_type=%s)", _resolved_auth_type_label())
         mcp.run()
         return
-    logger.info("Running FastMCP over HTTP at http://%s:%s", host, port)
-    domain = os.getenv("IDCS_DOMAIN")
-    client_id = os.getenv("IDCS_CLIENT_ID")
-    client_secret = os.getenv("IDCS_CLIENT_SECRET")
-    base_url = os.getenv("ORACLE_MCP_BASE_URL", "")
-    audience = os.getenv("IDCS_AUDIENCE")
-    if not all((domain, client_id, client_secret, audience, base_url)):
-        raise RuntimeError(
-            "HTTP transport requires IDCS authentication. "
-            "Set IDCS_DOMAIN, IDCS_CLIENT_ID, IDCS_CLIENT_SECRET, IDCS_AUDIENCE, "
-            "ORACLE_MCP_BASE_URL, ORACLE_MCP_HOST, and ORACLE_MCP_PORT."
-        )
-    mcp.auth = OCIProvider(
-        config_url=f"https://{domain}/.well-known/openid-configuration",
-        client_id=client_id,
-        client_secret=client_secret,
-        audience=audience,
-        required_scopes=parse_scopes(os.getenv("IDCS_REQUIRED_SCOPES")) or f"openid profile email oci_mcp.{__project__.removeprefix('oracle.oci-').removesuffix('-mcp-server').replace('-', '_')}.invoke".split(),
-        base_url=base_url,
-    )
+
+    # HTTP transport authenticates every caller against an OCI IAM (IDCS) domain;
+    # local profile credentials are never used to serve a network listener.
+    logger.info("Running FastMCP over streamable HTTP with OCI IAM OAuth at http://%s:%s", host, port)
+    _http_auth = _build_http_auth()
+    mcp.auth = _http_auth.provider
     mcp.run(transport="http", host=host, port=int(port))
 
 
