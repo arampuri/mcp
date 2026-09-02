@@ -132,7 +132,75 @@ class ProtectedDatabaseRedoCounts(OCIBaseModel):
         alias="disabled",
         description="Count of Protected Databases with is_redo_logs_enabled = False.",
     )
-    total: int = Field(0, alias="total", description="Total counted (enabled + disabled).")
+    unknown: int = Field(
+        0,
+        alias="unknown",
+        description=(
+            "Count of Protected Databases whose redo status could not be read, for example "
+            "when the caller cannot GET the database. These are not counted as disabled."
+        ),
+    )
+    total: int = Field(
+        0,
+        alias="total",
+        description="Total counted (enabled + disabled); see unknown for those that could not be read.",
+    )
+
+
+class ProtectedDatabaseHealthSummary(OCIBaseModel):
+    """
+    What summarize_protected_database_health returns: tenancy-wide totals, the
+    same counts per compartment, and the compartments that were scanned.
+    """
+
+    aggregated: ProtectedDatabaseHealthCounts = Field(
+        ...,
+        alias="aggregated",
+        description="Counts summed across every compartment scanned.",
+    )
+    per_compartment: list[ProtectedDatabaseHealthCounts] = Field(
+        default_factory=list,
+        alias="per_compartment",
+        description="The same counts, one entry per compartment scanned.",
+    )
+    compartment_ids_scanned: list[str] = Field(
+        default_factory=list,
+        alias="compartmentIdsScanned",
+        description="OCIDs of the compartments included in this summary.",
+    )
+    truncated: bool = Field(
+        False,
+        alias="truncated",
+        description="True when the scan stopped early at its deadline, so counts are partial.",
+    )
+
+
+class ProtectedDatabaseRedoSummary(OCIBaseModel):
+    """
+    What summarize_protected_database_redo_status returns: tenancy-wide totals,
+    the same counts per compartment, and the compartments that were scanned.
+    """
+
+    aggregated: ProtectedDatabaseRedoCounts = Field(
+        ...,
+        alias="aggregated",
+        description="Counts summed across every compartment scanned.",
+    )
+    per_compartment: list[ProtectedDatabaseRedoCounts] = Field(
+        default_factory=list,
+        alias="per_compartment",
+        description="The same counts, one entry per compartment scanned.",
+    )
+    compartment_ids_scanned: list[str] = Field(
+        default_factory=list,
+        alias="compartmentIdsScanned",
+        description="OCIDs of the compartments included in this summary.",
+    )
+    truncated: bool = Field(
+        False,
+        alias="truncated",
+        description="True when the scan stopped early at its deadline, so counts are partial.",
+    )
 
 
 class ProtectedDatabaseBackupSpaceSum(OCIBaseModel):

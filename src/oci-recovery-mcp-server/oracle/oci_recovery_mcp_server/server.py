@@ -41,6 +41,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import tempfile
 import time
 import traceback
 import uuid
@@ -80,7 +81,9 @@ from oracle.oci_recovery_mcp_server.models import (
     ProtectedDatabaseBackupDestinationSummary,
     ProtectedDatabaseBackupSpaceSum,
     ProtectedDatabaseHealthCounts,
+    ProtectedDatabaseHealthSummary,
     ProtectedDatabaseRedoCounts,
+    ProtectedDatabaseRedoSummary,
     ProtectedDatabaseSummary,
     ProtectionPolicy,
     RecoveryServiceSubnet,
@@ -142,19 +145,69 @@ if _ENV_FILE:
 """
 
 # Logging setup
+_STATE_DIR_ENV = "ORACLE_MCP_STATE_DIR"
+_STATE_DIR_NAME = ".oci-recovery-mcp"
+
+# Where logging actually ended up, reported at startup. Set by setup_logging().
+_LOG_DESTINATION = "stderr"
+
+
+def _state_dir() -> Path:
+    """Per-user directory for this server's own state (logs, installation id).
+
+    Deliberately outside the install tree: the package directory belongs to the
+    installer, is read-only on a hardened deployment, and is discarded entirely
+    between `uvx` runs -- which would silently throw away the logs an operator is
+    told to read. Override with ORACLE_MCP_STATE_DIR when the home directory is
+    not writable either.
+    """
+    configured = (os.getenv(_STATE_DIR_ENV) or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        return Path.home() / _STATE_DIR_NAME
+    except (RuntimeError, OSError):
+        # Path.home() raises when the environment has no home directory at all,
+        # which happens in minimal containers.
+        return Path(tempfile.gettempdir()) / _STATE_DIR_NAME
+
+
+def _resolved_log_file() -> str:
+    """The log file this process writes to, before any fallback is applied."""
+    log_dir = os.getenv("ORACLE_MCP_LOG_DIR") or str(_state_dir() / "logs")
+    return os.path.abspath(
+        os.getenv("ORACLE_MCP_LOG_FILE") or os.path.join(log_dir, "oci_recovery_mcp_server.log")
+    )
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """Rotating handler whose files are readable only by their owner.
+
+    Tool arguments, and tool results at DEBUG, put a tenancy's resource inventory
+    in this file. Rotation opens a new file each time, so the mode is applied on
+    every open rather than once at setup.
+    """
+
+    def _open(self):
+        stream = super()._open()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            # An unchmod-able file (a mounted pipe, an exotic filesystem) is not
+            # a reason to stop logging; the file just keeps its default mode.
+            pass
+        return stream
+
+
 def setup_logging():
+    global _LOG_DESTINATION
+
     # Resolve log level from env, default to INFO
     level_name = os.getenv("ORACLE_MCP_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     log_to_stdout_env = os.getenv("ORACLE_MCP_LOG_TO_STDOUT")
     if log_to_stdout_env is None:
         os.environ["ORACLE_MCP_LOG_TO_STDOUT"] = "0"
-
-    # Compute default log dir relative to project root; allow env override
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-    log_dir = os.getenv("ORACLE_MCP_LOG_DIR", os.path.join(base_dir, "logs"))
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.getenv("ORACLE_MCP_LOG_FILE", os.path.join(log_dir, "oci_recovery_mcp_server.log"))
 
     # Configure root logger once
     root_logger = logging.getLogger()
@@ -165,25 +218,43 @@ def setup_logging():
         datefmt="%Y-%m-%d %H:%M:%S%z",
     )
 
-    # Add a rotating file handler if not already present for this file
-    abs_log_file = os.path.abspath(log_file)
+    # Add a rotating file handler if not already present for this file. File
+    # logging is best-effort: a read-only filesystem, a directory owned by
+    # another user, or a full disk must not stop the server from starting, so
+    # the handler falls back to stderr instead of raising through the import.
+    abs_log_file = _resolved_log_file()
     has_file = any(
         isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == abs_log_file
         for h in root_logger.handlers
     )
+    file_error: Optional[OSError] = None
     if not has_file:
-        fh = RotatingFileHandler(abs_log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
-        fh.setLevel(level)
-        fh.setFormatter(formatter)
-        root_logger.addHandler(fh)
+        try:
+            os.makedirs(os.path.dirname(abs_log_file), exist_ok=True)
+            fh = _PrivateRotatingFileHandler(
+                abs_log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            )
+        except OSError as error:
+            file_error = error
+        else:
+            fh.setLevel(level)
+            fh.setFormatter(formatter)
+            root_logger.addHandler(fh)
+            _LOG_DESTINATION = abs_log_file
+    elif not file_error:
+        _LOG_DESTINATION = abs_log_file
 
-    # Optional console handler (default on; set ORACLE_MCP_LOG_TO_STDOUT=0 to disable)
-    if os.getenv("ORACLE_MCP_LOG_TO_STDOUT", "0").lower() in (
+    # Console handler. Off by default so it can never interleave with the MCP
+    # protocol on stdout; note StreamHandler writes to stderr, so enabling it is
+    # safe for stdio transport too. Forced on when file logging was unavailable,
+    # since otherwise the server would run with no diagnostics at all.
+    console_requested = os.getenv("ORACLE_MCP_LOG_TO_STDOUT", "0").lower() in (
         "1",
         "true",
         "yes",
         "y",
-    ):
+    )
+    if console_requested or file_error is not None:
         has_stream = any(
             isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler)
             for h in root_logger.handlers
@@ -197,6 +268,15 @@ def setup_logging():
     # Quiet noisy libraries by default; override with ORACLE_SDK_LOG_LEVEL
     logging.getLogger("oci").setLevel(os.getenv("ORACLE_SDK_LOG_LEVEL", "WARNING"))
     logging.getLogger("urllib3").setLevel("WARNING")
+
+    if file_error is not None:
+        _LOG_DESTINATION = "stderr"
+        logging.getLogger(__name__).warning(
+            "File logging is disabled: %s is not writable (%s). Logging to stderr instead; "
+            "set ORACLE_MCP_LOG_DIR or ORACLE_MCP_STATE_DIR to a writable path.",
+            abs_log_file,
+            file_error,
+        )
 
 
 setup_logging()
@@ -234,6 +314,30 @@ def _truncate_str(s: str) -> str:
     if _LOG_MAX_VALUE_CHARS and len(s) > _LOG_MAX_VALUE_CHARS:
         return s[:_LOG_MAX_VALUE_CHARS] + f"...(truncated,len={len(s)})"
     return s
+
+
+def _payload_summary(obj: Any) -> dict[str, Any]:
+    """Describe a result without reproducing it.
+
+    Logged at INFO in place of the payload itself: a tool result is a tenancy's
+    resource inventory, and writing it to disk on every call is both a lot of
+    volume and a lot of customer data at rest. The full value is still logged at
+    DEBUG, which is what a support engineer turns on deliberately.
+    """
+    if obj is None:
+        return {"type": "none"}
+    if isinstance(obj, (list, tuple, set)):
+        return {"type": "list", "count": len(obj)}
+    if isinstance(obj, dict):
+        return {"type": "dict", "keys": sorted(str(k) for k in obj)[:20]}
+    if isinstance(obj, (bool, int, float, str)):
+        return {"type": type(obj).__name__}
+    return {"type": type(obj).__name__}
+
+
+def _log_full_payloads() -> bool:
+    """Whether DEBUG logging is on, and full payloads should be written out."""
+    return logger.isEnabledFor(logging.DEBUG)
 
 
 def _safe_jsonable(obj: Any) -> Any:
@@ -358,7 +462,7 @@ def _installation_id_file() -> Path:
     configured = (os.getenv(_MCP_INSTALLATION_ID_FILE_ENV) or "").strip()
     if configured:
         return Path(configured).expanduser()
-    return Path.home() / ".oci-recovery-mcp" / "installation-id"
+    return _state_dir() / "installation-id"
 
 
 def _mcp_installation_id() -> str:
@@ -532,11 +636,15 @@ def _wrap_oci_client(client: Any, *, request_id: str, client_name: str):
                         payload["next_page"] = getattr(resp, "next_page", None)
                     except Exception:
                         pass
-                    # Log full data as requested (may be truncated)
+                    # Response bodies carry the same customer data as tool results,
+                    # so they follow the same rule: shape at INFO, body at DEBUG.
                     try:
-                        payload["data"] = _safe_jsonable(getattr(resp, "data", resp))
+                        data = getattr(resp, "data", resp)
+                        payload["data_summary"] = _payload_summary(data)
+                        if _log_full_payloads():
+                            payload["data"] = _safe_jsonable(data)
                     except Exception:
-                        payload["data"] = "<unavailable>"
+                        payload["data_summary"] = {"type": "unavailable"}
                     _log_event(
                         "oci_call",
                         request_id=request_id,
@@ -604,12 +712,18 @@ def _tool_logger(tool_name: str):
             try:
                 out = fn(*args, **kwargs)
                 dur_ms = int((time.time() - start) * 1000)
+                end_payload: dict[str, Any] = {
+                    "duration_ms": dur_ms,
+                    "result_summary": _payload_summary(out),
+                }
+                if _log_full_payloads():
+                    end_payload["result"] = _safe_jsonable(out)
                 _log_event(
                     "tool_call",
                     request_id=request_id,
                     tool=tool_name,
                     phase="end",
-                    payload={"duration_ms": dur_ms, "result": _safe_jsonable(out)},
+                    payload=end_payload,
                 )
                 return out
             except Exception as e:
@@ -642,7 +756,13 @@ _USER_AGENT_NAME = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
 _ADDITIONAL_UA = f"{_USER_AGENT_NAME}/{__version__}"
 
 
-def _legacy_auth_type_override() -> Optional[AuthType]:
+# Auth-type variables the shared library reads ahead of ORACLE_MCP_AUTH_METHOD, in
+# its own order of precedence. Anything set here already decides the auth type, so
+# the deprecated spelling below must not be translated.
+_CANONICAL_AUTH_TYPE_ENV = ("OCI_MCP_AUTH_TYPE", "OCI_IOT_AUTH_TYPE", "OCI_AUTH_TYPE")
+
+
+def _deprecated_auth_method_override() -> Optional[AuthType]:
     """Translate the one 2.x ORACLE_MCP_AUTH_METHOD spelling the shared library rejects.
 
     oracle-mcp-common already reads ORACLE_MCP_AUTH_METHOD itself and maps
@@ -651,12 +771,22 @@ def _legacy_auth_type_override() -> Optional[AuthType]:
     "apikey" spelling that this server's 2.x README documented, though, and an
     unrecognized value is a hard error -- so translate only that case.
 
+    The translation is passed to build_auth_context() as an explicit AuthOptions
+    value, which outranks every environment variable in resolve_auth_type(). So it
+    is applied only when no canonical OCI_* auth-type variable is set: otherwise the
+    deprecated name would silently beat OCI_MCP_AUTH_TYPE, the opposite of what this
+    server documents, and OCI_MCP_AUTH_TYPE=security_token would authenticate with
+    the profile's API key -- either failing to build a signer at all, or building one
+    from the ephemeral session key that OCI then rejects with 401 on every request.
+
     Everything else is left to resolve_auth_type(), including an unset value, which
     selects "auto": session-token when the profile directly declares a
     security_token_file, otherwise API-key. Forcing a type here instead would break
     that detection -- an API-key-only profile would be rejected for having no
     security_token_file.
     """
+    if any((os.getenv(name) or "").strip() for name in _CANONICAL_AUTH_TYPE_ENV):
+        return None
     raw = (os.getenv("ORACLE_MCP_AUTH_METHOD") or "").strip().lower()
     if raw == "apikey":
         return AuthType.API_KEY
@@ -666,7 +796,7 @@ def _legacy_auth_type_override() -> Optional[AuthType]:
 def _resolved_auth_type_label() -> str:
     """The auth type the shared library will use, for the startup log line only."""
     try:
-        override = _legacy_auth_type_override()
+        override = _deprecated_auth_method_override()
         return (override or resolve_auth_type()).value
     except Exception:
         return "unresolved"
@@ -675,9 +805,9 @@ def _resolved_auth_type_label() -> str:
 def _first_env(*names: str, default: Optional[str] = None) -> Optional[str]:
     """Return the first non-empty environment variable among names."""
     for n in names:
-        v = os.getenv(n)
-        if v is not None and v.strip() != "":
-            return v.strip()
+        v = (os.getenv(n) or "").strip()
+        if v:
+            return v
     return default
 
 
@@ -705,10 +835,10 @@ def _build_profile_auth_context():
 
     The library owns auth-type and profile resolution, including this server's
     ORACLE_MCP_AUTH_METHOD/ORACLE_MCP_AUTH_PROFILE variables, so nothing is passed
-    unless the legacy "apikey" spelling needs translating (see
-    _legacy_auth_type_override).
+    unless the deprecated "apikey" spelling needs translating (see
+    _deprecated_auth_method_override).
     """
-    override = _legacy_auth_type_override()
+    override = _deprecated_auth_method_override()
     if override is not None:
         return build_auth_context(AuthOptions(auth_type=override))
     return build_auth_context()
@@ -766,32 +896,40 @@ def _qualify_upstream_scopes(provider, *, audience: str, scopes: list[str]) -> l
     The access token IDCS issues, however, carries the scope *bare* in its `scope`
     claim, with the audience in `aud`. That token is what gets re-validated on every
     request (OAuthProxy.load_access_token swaps the FastMCP JWT for it), and the
-    verifier requires `required_scopes` to be a subset of that claim. So the same
-    setting is needed in two incompatible forms: qualified going out, bare coming
-    back. Configuring either one alone breaks the other half of the flow.
+    scope check requires the configured scopes to be a subset of that claim. So the
+    same setting is needed in two incompatible forms: qualified going out, bare
+    coming back. Configuring either one alone breaks the other half of the flow.
 
-    We therefore keep the verifier's `required_scopes` bare -- it is what
-    verification and the bearer-scope check compare against -- and qualify only the
-    scopes advertised to clients, which is what a client requests and what the
-    upstream authorize URL is built from. Reserved OIDC scopes and anything already
-    absolute are left alone.
+    The split is therefore by direction, not by object: every surface that *reaches
+    IDCS* carries the qualified form, and every surface that is *compared against an
+    issued token* stays bare. Reserved OIDC scopes and anything already absolute are
+    left alone.
 
-    Three separate places build an upstream request, and each reads the scopes from
-    somewhere different, so all three have to be qualified:
+    Qualified, because IDCS reads them:
 
       * `update_default_scopes` covers DCR registration defaults, `valid_scopes`,
         and the metadata clients read to decide what to request.
-      * `required_scopes` on the *proxy* is what `_build_upstream_authorize_url`
-        falls back to when the client sends no `scope` parameter at all -- which
-        clients do, and which no amount of correct advertising prevents. This is
-        safe to overwrite because the proxy's own `required_scopes` is read *only*
-        there; scope verification compares against `token_verifier.required_scopes`,
-        a different object that stays bare.
+      * `_build_upstream_authorize_url` builds the actual `/authorize` request. It
+        uses the scopes the client sent, falling back to the proxy's
+        `required_scopes` when the client sends no `scope` parameter at all -- which
+        clients do, and which no amount of correct advertising prevents. Wrapping
+        the method qualifies both sources at the one point they converge.
       * `_prepare_scopes_for_upstream_refresh` builds the refresh request from the
         scopes stored on the refresh token, and those were parsed from the IDCS
         token response -- so they are bare. Left alone, sign-in succeeds and then
         the session dies at the first refresh, an hour later, with the same
         `invalid_scope` far from any change that would explain it.
+
+    Bare, because they are matched against the token IDCS issued:
+
+      * `token_verifier.required_scopes`, which the verifier compares to the token's
+        `scope` claim.
+      * `provider.required_scopes`, which FastMCP hands to `RequireAuthMiddleware`
+        when it builds the transport routes (fastmcp/server/http.py). That check
+        compares against the same bare claim, so qualifying this field would return
+        `insufficient_scope` on every request of an otherwise valid session. It is
+        left untouched for that reason -- the authorize fallback that also reads it
+        is handled in the wrapper above instead.
 
     FastMCP's own AzureProvider solves the same audience-qualification problem the
     same way, which is why these are the hooks that exist to override.
@@ -799,6 +937,7 @@ def _qualify_upstream_scopes(provider, *, audience: str, scopes: list[str]) -> l
     for attr in (
         "update_default_scopes",
         "required_scopes",
+        "_build_upstream_authorize_url",
         "_prepare_scopes_for_upstream_refresh",
     ):
         if not hasattr(provider, attr):
@@ -808,21 +947,23 @@ def _qualify_upstream_scopes(provider, *, audience: str, scopes: list[str]) -> l
                 "IDCS would reject sign-in with 'invalid_scope'."
             )
 
-    if getattr(provider, "_verify_id_token", False) is True:
-        # OIDCProxy strips scopes off the verifier when it validates the id_token
-        # instead of the access token, and moves enforcement onto the provider's
-        # own required_scopes -- the field qualified just below. Under that mode
-        # the two uses collide again and qualifying would reject every request,
-        # so refuse rather than reintroduce the 401 loop silently.
-        raise RuntimeError(
-            "This provider verifies the id_token, which makes 'required_scopes' the "
-            "scope-enforcement point as well as the upstream authorize fallback. Those "
-            "need opposite forms, so the resource scopes cannot be qualified safely."
-        )
-
     qualified = _qualify(audience, scopes)
     provider.update_default_scopes(qualified)
-    provider.required_scopes = qualified
+
+    build_authorize_url = provider._build_upstream_authorize_url
+
+    def _qualified_authorize_url(
+        txn_id,
+        transaction,
+        _build=build_authorize_url,
+        _aud=audience,
+        _fallback=list(provider.required_scopes) or list(scopes),
+    ):
+        """Qualify the scopes of an /authorize request, whatever their source."""
+        requested = list(transaction.get("scopes") or []) or list(_fallback)
+        return _build(txn_id, {**transaction, "scopes": _qualify(_aud, requested)})
+
+    provider._build_upstream_authorize_url = _qualified_authorize_url
     # Falls back to the configured scopes when a refresh token carries none,
     # mirroring what the authorize path does with an empty transaction.
     provider._prepare_scopes_for_upstream_refresh = (
@@ -945,6 +1086,18 @@ def _config_and_signer(region: str | None = None):
     """Resolve OCI SDK configuration and a signer for the current call."""
     if _serving_http():
         return _http_config_and_signer(region)
+    if _http_auth is not None:
+        # main() built an HTTP authentication policy, so this process serves
+        # network callers and has no business signing anything with the
+        # operator's own credentials. Reaching here means the per-request
+        # detection above failed to see a request it should have seen; refusing
+        # is the only safe outcome, since the alternative is performing one
+        # caller's request under a different, probably broader, identity.
+        raise RuntimeError(
+            "Refusing to use local profile credentials on an HTTP deployment: this call "
+            "arrived outside an authenticated request context, so there is no caller "
+            "identity to act as."
+        )
     auth_context = _build_profile_auth_context()
     config = {**auth_context.config, "additional_user_agent": _ADDITIONAL_UA}
     if region is not None:
@@ -980,6 +1133,20 @@ def _make_client(
     rid = request_id or uuid.uuid4().hex
     return _wrap_oci_client(client, request_id=rid, client_name=client_name)
 
+
+# Every tool here reads; none creates, updates or deletes an OCI resource. These
+# hints tell an MCP host that much without a human reading the README, so a host
+# can skip a confirmation prompt it would otherwise raise on an unknown tool.
+_READ_ONLY_TOOL = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    # Results come from OCI, not from a closed set the server owns.
+    "openWorldHint": True,
+}
+
+# The guidance tools return static text and never reach the network.
+_LOCAL_GUIDANCE_TOOL = {**_READ_ONLY_TOOL, "openWorldHint": False}
 
 # Create the FastMCP app that exposes the functions decorated with @mcp.tool.
 # main() attaches the OCI IAM OAuth provider when it selects the HTTP transport.
@@ -1116,6 +1283,69 @@ def _caller_cache_key() -> str:
     return "sub:" + hashlib.sha256(str(subject).encode()).hexdigest()[:16]
 
 
+_TOOL_DEADLINE_SECONDS = float(os.getenv("ORACLE_MCP_TOOL_DEADLINE_SECONDS", "120"))
+
+
+class _Deadline:
+    """A cooperative monotonic-time budget for a fan-out the caller cannot see.
+
+    The summary tools issue one request per protected database across every
+    compartment in scope, so a large tenancy turns a single tool call into
+    hundreds of sequential round trips -- long past the point where an MCP client
+    has given up waiting. Stopping at a deadline and saying so is more useful
+    than a request that never returns. Set ORACLE_MCP_TOOL_DEADLINE_SECONDS to 0
+    to scan without a limit. An OCI request already in flight is allowed to
+    finish; callers check the budget between requests.
+    """
+
+    def __init__(self, seconds: Optional[float] = None):
+        budget = _TOOL_DEADLINE_SECONDS if seconds is None else seconds
+        self._expires_at = (time.monotonic() + budget) if budget and budget > 0 else None
+        self.expired = False
+
+    def reached(self) -> bool:
+        if self._expires_at is not None and time.monotonic() >= self._expires_at:
+            self.expired = True
+        return self.expired
+
+
+_CACHE_MAX_ENTRIES = int(os.getenv("ORACLE_MCP_CACHE_MAX_ENTRIES", "256"))
+
+
+def _cache_get(entries: dict[str, Any], key: str, *, ttl: float, now: float) -> Optional[Any]:
+    """Return a live cache entry, refreshing its recency, or None.
+
+    Reinserting on a hit makes the dict's insertion order a true LRU order, which
+    is what _cache_put evicts from.
+    """
+    cached = entries.get(key)
+    if not cached:
+        return None
+    if now - float(cached.get("fetched_at") or 0.0) >= ttl:
+        entries.pop(key, None)
+        return None
+    entries[key] = entries.pop(key)
+    return cached
+
+
+def _cache_put(entries: dict[str, Any], key: str, value: Any, *, ttl: float, now: float) -> None:
+    """Store a cache entry, sweeping expired ones and bounding the total.
+
+    These caches are partitioned per tenant and per caller, so on the hosted HTTP
+    transport they gain an entry for every person who signs in and each one holds
+    that caller's whole compartment listing. Without a bound the process grows
+    with the user count for the life of the deployment.
+    """
+    for expired in [
+        k for k, v in entries.items() if now - float(v.get("fetched_at") or 0.0) >= ttl
+    ]:
+        entries.pop(expired, None)
+    entries.pop(key, None)
+    entries[key] = value
+    while len(entries) > _CACHE_MAX_ENTRIES:
+        entries.pop(next(iter(entries)))
+
+
 _REGION_CACHE: dict[str, Any] = {
     "ttl_seconds": int(os.getenv("ORACLE_MCP_REGION_CACHE_TTL_SECONDS", "3600")),
     # items: dict[tenant_key -> {"regions": list[dict], "fetched_at": float}]
@@ -1136,8 +1366,8 @@ def _iam_subscribed_regions_with_status(*, request_id: str) -> list[dict]:
 
     tenancy_id = get_tenancy()
     cache_key = f"iam:list_region_subscriptions:{tenancy_id}"
-    cached = items.get(cache_key)
-    if cached and (now - float(cached.get("fetched_at") or 0.0)) < ttl:
+    cached = _cache_get(items, cache_key, ttl=ttl, now=now)
+    if cached:
         return cached.get("regions") or []
 
     identity = get_identity_client(request_id=request_id)
@@ -1152,7 +1382,7 @@ def _iam_subscribed_regions_with_status(*, request_id: str) -> list[dict]:
             out.append({"region": region_name, "status": status})
 
     out = sorted(out, key=lambda x: x.get("region") or "")
-    items[cache_key] = {"regions": out, "fetched_at": now}
+    _cache_put(items, cache_key, {"regions": out, "fetched_at": now}, ttl=ttl, now=now)
     return out
 
 
@@ -1231,9 +1461,9 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
     ttl = float(_COMPARTMENT_CACHE.get("ttl_seconds") or 300)
     entries = _COMPARTMENT_CACHE.setdefault("entries", {})
     cache_key = f"{_tenant_cache_key()}|{_caller_cache_key()}"
-    cached = entries.get(cache_key)
+    cached = _cache_get(entries, cache_key, ttl=ttl, now=now)
 
-    if cached and cached.get("items") and (now - float(cached.get("fetched_at") or 0.0)) < ttl:
+    if cached and cached.get("items"):
         return cached["items"]  # type: ignore[return-value]
 
     rid = request_id or uuid.uuid4().hex
@@ -1279,7 +1509,7 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
         )
         comps = []
 
-    entries[cache_key] = {"items": comps, "fetched_at": now}
+    _cache_put(entries, cache_key, {"items": comps, "fetched_at": now}, ttl=ttl, now=now)
     return comps
 
 
@@ -1674,6 +1904,7 @@ def get_compartment_by_name_tool(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Lists protected databases in a compartment with optional filters. For each "
         "database it also includes Recovery Service Subnet details, removes noisy "
@@ -1923,6 +2154,7 @@ def list_protected_databases(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Gets a protected database by OCID and presents a clean, easy‑to‑read view. "
         "It includes Recovery Service Subnet details, hides noisy fields, and adds "
@@ -2082,6 +2314,7 @@ def get_protected_database(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Shows how many protected databases are healthy, warning, alert, or unknown "
         "in a compartment. If a quick list doesn’t include health, it checks each "
@@ -2100,7 +2333,7 @@ def summarize_protected_database_health(
         "When true, scans the full subtree under compartment_id (including child compartments) and returns aggregated counts plus per-compartment breakdown.",
     ] = False,
     region: Annotated[Optional[str], "OCI region to execute the request in (e.g., us-ashburn-1)"] = None,
-) -> ProtectedDatabaseHealthCounts:
+) -> ProtectedDatabaseHealthSummary:
     """
     Summarizes Protected Database health status counts (PROTECTED, WARNING, ALERT, UNKNOWN) in a compartment.
     The tool lists protected databases, reads health from summary when available, falls back to GET per PD,
@@ -2124,11 +2357,16 @@ def summarize_protected_database_health(
         scanned = 0
 
         per_compartment: list[dict] = []
+        deadline = _Deadline()
+        scanned_compartments: list[str] = []
 
         has_next_page = True
         next_page: Optional[str] = None
 
         for each_comp in comp_ids:
+            if deadline.reached():
+                break
+            scanned_compartments.append(each_comp)
             c_protected = 0
             c_warning = 0
             c_alert = 0
@@ -2138,7 +2376,7 @@ def summarize_protected_database_health(
             has_next_page = True
             next_page = None
 
-            while has_next_page:
+            while has_next_page and not deadline.reached():
                 # Fetch ACTIVE PDs page by page
                 list_kwargs = {
                     "compartment_id": each_comp,
@@ -2152,6 +2390,8 @@ def summarize_protected_database_health(
                 data = response.data
                 items = getattr(data, "items", data)
                 for item in items or []:
+                    if deadline.reached():
+                        break
                     # Try to read health from list summary; shape can vary by SDK versions
                     health = getattr(item, "health", None)
                     if not health and hasattr(item, "__dict__"):
@@ -2241,33 +2481,28 @@ def summarize_protected_database_health(
             unknown=unknown,
             total=total,
         )
-        try:
-            agg_dict = aggregated.model_dump(exclude_none=False, by_alias=True)
-        except Exception:
-            try:
-                agg_dict = aggregated.dict(exclude_none=False, by_alias=True)
-            except Exception:
-                agg_dict = {
-                    "compartmentId": comp_id,
-                    "region": region,
-                    "protected": protected,
-                    "warning": warning,
-                    "alert": alert,
-                    "unknown": unknown,
-                    "total": total,
-                }
+        if deadline.expired:
+            logger.warning(
+                "Health summary stopped at its %ss deadline after %s of %s compartments; "
+                "counts are partial.",
+                _TOOL_DEADLINE_SECONDS,
+                len(scanned_compartments),
+                len(comp_ids),
+            )
 
-        return {
-            "aggregated": agg_dict,
-            "per_compartment": per_compartment,
-            "compartmentIdsScanned": comp_ids,
-        }
+        return ProtectedDatabaseHealthSummary(
+            aggregated=aggregated,
+            per_compartment=per_compartment,
+            compartmentIdsScanned=scanned_compartments,
+            truncated=deadline.expired,
+        )
     except Exception as e:
         logger.error(f"Error in summarize_protected_database_health tool: {str(e)}")
         raise
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Use this tool for real-time protection status questions. It shows how many "
         "protected databases have redo transport (real-time protection) turned on or "
@@ -2287,7 +2522,7 @@ def summarize_protected_database_redo_status(
         "When true, scans the full subtree under compartment_id (including child compartments) and returns aggregated counts plus per-compartment breakdown.",
     ] = False,
     region: Annotated[Optional[str], "OCI region to execute the request in (e.g., us-ashburn-1)"] = None,
-) -> ProtectedDatabaseRedoCounts:
+) -> ProtectedDatabaseRedoSummary:
     """
     Summarizes redo transport enablement for Protected Databases in a compartment.
     Lists protected databases then fetches each to inspect
@@ -2305,19 +2540,26 @@ def summarize_protected_database_redo_status(
 
         enabled = 0
         disabled = 0
+        unknown = 0
         per_compartment: list[dict] = []
+        deadline = _Deadline()
+        scanned_compartments: list[str] = []
 
         has_next_page = True
         next_page: Optional[str] = None
 
         for each_comp in comp_ids:
+            if deadline.reached():
+                break
+            scanned_compartments.append(each_comp)
             c_enabled = 0
             c_disabled = 0
+            c_unknown = 0
 
             has_next_page = True
             next_page = None
 
-            while has_next_page:
+            while has_next_page and not deadline.reached():
                 # List ACTIVE PDs to assess redo status via GET per PD
                 list_kwargs = {
                     "compartment_id": each_comp,
@@ -2331,6 +2573,8 @@ def summarize_protected_database_redo_status(
                 data = response.data
                 items = getattr(data, "items", data)
                 for item in items or []:
+                    if deadline.reached():
+                        break
                     # Robustly get the PD OCID from summary item
                     pd_id = getattr(item, "id", None) or (
                         getattr(item, "data", None) and getattr(item.data, "id", None)
@@ -2342,6 +2586,8 @@ def summarize_protected_database_redo_status(
                         except Exception:
                             pd_id = None
                     if not pd_id:
+                        unknown += 1
+                        c_unknown += 1
                         continue
 
                     # Fetch full Protected Database to read is_redo_logs_shipped (primary)
@@ -2379,8 +2625,11 @@ def summarize_protected_database_redo_status(
                         disabled += 1
                         c_disabled += 1
                     else:
-                        # None/unknown -> do not count
-                        pass
+                        # Unreadable is not the same as disabled. Counting it here
+                        # keeps a permissions gap visible instead of reporting a
+                        # reassuring total that quietly left databases out.
+                        unknown += 1
+                        c_unknown += 1
 
             per_compartment.append(
                 {
@@ -2388,17 +2637,20 @@ def summarize_protected_database_redo_status(
                     "region": region,
                     "enabled": c_enabled,
                     "disabled": c_disabled,
+                    "unknown": c_unknown,
                     "total": c_enabled + c_disabled,
                 }
             )
 
         total = enabled + disabled
         logger.info(
-            "Redo transport summary for compartment %s (region=%s): ENABLED=%s, DISABLED=%s, TOTAL=%s",
+            "Redo transport summary for compartment %s (region=%s): "
+            "ENABLED=%s, DISABLED=%s, UNKNOWN=%s, TOTAL=%s",
             comp_id,
             region,
             enabled,
             disabled,
+            unknown,
             total,
         )
         # NOTE: construct using the alias key (compartmentId) to avoid any
@@ -2408,33 +2660,31 @@ def summarize_protected_database_redo_status(
             region=region,
             enabled=enabled,
             disabled=disabled,
+            unknown=unknown,
             total=total,
         )
-        try:
-            agg_dict = aggregated.model_dump(exclude_none=False, by_alias=True)
-        except Exception:
-            try:
-                agg_dict = aggregated.dict(exclude_none=False, by_alias=True)
-            except Exception:
-                agg_dict = {
-                    "compartmentId": comp_id,
-                    "region": region,
-                    "enabled": enabled,
-                    "disabled": disabled,
-                    "total": total,
-                }
+        if deadline.expired:
+            logger.warning(
+                "Redo transport summary stopped at its %ss deadline after %s of %s "
+                "compartments; counts are partial.",
+                _TOOL_DEADLINE_SECONDS,
+                len(scanned_compartments),
+                len(comp_ids),
+            )
 
-        return {
-            "aggregated": agg_dict,
-            "per_compartment": per_compartment,
-            "compartmentIdsScanned": comp_ids,
-        }
+        return ProtectedDatabaseRedoSummary(
+            aggregated=aggregated,
+            per_compartment=per_compartment,
+            compartmentIdsScanned=scanned_compartments,
+            truncated=deadline.expired,
+        )
     except Exception as e:
         logger.error(f"Error in summarize_protected_database_redo_status tool: {e}")
         raise
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Adds up the backup space (in GB) used by protected databases in a compartment, "
         "including only those with lifecycle state ACTIVE or DELETE_SCHEDULED (excluding "
@@ -2636,6 +2886,7 @@ def summarize_backup_space_used(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Checks OCI service limits for Autonomous Recovery Service using tenancy context from config profile."
         "It fetches resource availability for protected database backup storage (GB) "
@@ -2735,6 +2986,7 @@ def check_recovery_service_limits(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Lists the tenancy's subscribed regions and their status using "
         "IdentityClient.list_region_subscriptions(). "
@@ -2758,6 +3010,7 @@ def fetch_regions_subscribed(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Lists protection policies in a compartment with handy filters and automatic "
         "paging. The result is a straightforward list of protection policies."
@@ -2817,7 +3070,10 @@ def list_protection_policies(
                 if display_name is not None:
                     kwargs["display_name"] = display_name
                 if id is not None:
-                    kwargs["id"] = id
+                    # This SDK call names the filter protection_policy_id and rejects "id"
+                    # outright; list_protected_databases and list_recovery_service_subnets do
+                    # take "id", which is why only this one is remapped.
+                    kwargs["protection_policy_id"] = id
                 if limit is not None:
                     kwargs["limit"] = limit
                 if sort_order is not None:
@@ -2856,7 +3112,9 @@ def list_protection_policies(
         raise
 
 
-@mcp.tool(description=("Gets a protection policy by OCID and returns it as a simple object."))
+@mcp.tool(
+    annotations=_READ_ONLY_TOOL,
+    description=("Gets a protection policy by OCID and returns it as a simple object."))
 @_tool_logger("get_protection_policy")
 def get_protection_policy(
     protection_policy_id: Annotated[str, "Protection Policy OCID"],
@@ -2890,6 +3148,7 @@ def get_protection_policy(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Lists recovery service subnets in a compartment with helpful filters. When "
         "needed, it fills in the list of associated subnets or uses the subnet_id as "
@@ -3019,6 +3278,7 @@ def list_recovery_service_subnets(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Gets a recovery service subnet by OCID and makes sure the subnets list is "
         "present, using subnet_id if necessary. The result is one recovery service "
@@ -3065,7 +3325,90 @@ def get_recovery_service_subnet(
         raise
 
 
+# Fields of the mapped WorkRequest that list_restore can sort by. The OCI-style
+# camelCase spelling is what the API's own sort_by accepts, so both it and the
+# model's attribute name are recognised.
+_RESTORE_SORT_FIELDS = {
+    "timeaccepted": "time_accepted",
+    "time_accepted": "time_accepted",
+    "timestarted": "time_started",
+    "time_started": "time_started",
+    "timefinished": "time_finished",
+    "time_finished": "time_finished",
+    "status": "status",
+    "operationtype": "operation_type",
+    "operation_type": "operation_type",
+}
+_SORT_ORDERS = ("ASC", "DESC")
+
+
+def _sorted_work_requests(
+    items: list[WorkRequest], sort_by: Optional[str], sort_order: Optional[str]
+) -> list[WorkRequest]:
+    """Order restore work requests locally.
+
+    The Work Requests API has no sort parameters (see the call site), so sorting
+    happens here. Entries missing the sort field sort last in either direction,
+    rather than being dropped or raising on a None comparison.
+    """
+    if sort_by is None and sort_order is None:
+        return items
+
+    field = "time_accepted"
+    if sort_by is not None:
+        key = str(sort_by).strip().lower()
+        if key not in _RESTORE_SORT_FIELDS:
+            raise ValueError(
+                "sort_by must be one of: timeAccepted, timeStarted, timeFinished, "
+                f"status, operationType. Received: {sort_by!r}"
+            )
+        field = _RESTORE_SORT_FIELDS[key]
+
+    order = (sort_order or "DESC").strip().upper()
+    if order not in _SORT_ORDERS:
+        raise ValueError(f"sort_order must be one of: {', '.join(_SORT_ORDERS)}. Received: {sort_order!r}")
+
+    present = [item for item in items if getattr(item, field, None) is not None]
+    missing = [item for item in items if getattr(item, field, None) is None]
+    return sorted(
+        present,
+        key=lambda item: getattr(item, field),
+        reverse=(order == "DESC"),
+    ) + missing
+
+
+# Monitoring query vocabulary. The tool builds an MQL expression by
+# interpolation, so every part of it that comes from the caller is checked
+# against these first: an unvalidated value would let a caller reshape the query
+# (and break out of the quoted resourceId filter), and a typo would surface as an
+# opaque service-side parse error instead of a usable message.
+_METRIC_NAMES = (
+    "SpaceUsedForRecoveryWindow",
+    "ProtectedDatabaseSize",
+    "ProtectedDatabaseHealth",
+    "DataLossExposure",
+)
+_METRIC_RESOLUTIONS = ("1m", "5m", "1h", "1d")
+_METRIC_AGGREGATIONS = ("mean", "sum", "max", "min", "count")
+_OCID_RE = re.compile(r"^ocid1\.[a-z0-9]+\.[a-z0-9-]+\.[a-z0-9-]*\.[A-Za-z0-9._-]+$")
+
+
+def _validated_choice(value: str, allowed: tuple[str, ...], field: str) -> str:
+    """Return value if it is one of allowed, else raise a message naming them."""
+    if value not in allowed:
+        raise ValueError(f"{field} must be one of: {', '.join(allowed)}. Received: {value!r}")
+    return value
+
+
+def _validated_ocid(value: str, field: str) -> str:
+    """Return value if it is shaped like an OCID, else raise."""
+    if not _OCID_RE.match(value or ""):
+        raise ValueError(f"{field} must be an OCID (ocid1.<type>.<realm>...). Received: {value!r}")
+    return value
+
+
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Fetches Recovery Service metrics for a time range. You choose the metric, "
         "time step, and how to combine values, and you can limit it to one protected "
@@ -3101,13 +3444,22 @@ def get_recovery_service_metrics(
         "Optional protected database OCID to filter by (maps to resourceId dimension)",
     ] = None,
 ) -> list[dict]:
+    # Every interpolated part is validated before it reaches the query string.
+    metric_name = _validated_choice(metricName, _METRIC_NAMES, "metricName")
+    metric_resolution = _validated_choice(resolution, _METRIC_RESOLUTIONS, "resolution")
+    metric_aggregation = _validated_choice(aggregation, _METRIC_AGGREGATIONS, "aggregation")
+
+    filter_clause = ""
+    if protected_database_id:
+        resource_id = _validated_ocid(protected_database_id, "protected_database_id")
+        filter_clause = f'{{resourceId="{resource_id}"}}'
+
     # Build Monitoring query against Recovery metrics namespace
     request_id = uuid.uuid4().hex
     monitoring_client = get_monitoring_client(request_id=request_id)
     namespace = "oci_recovery_service"
-    filter_clause = f'{{resourceId="{protected_database_id}"}}' if protected_database_id else ""
     # Query format: MetricName[resolution]{filters}.aggregation()
-    query = f"{metricName}[{resolution}]{filter_clause}.{aggregation}()"
+    query = f"{metric_name}[{metric_resolution}]{filter_clause}.{metric_aggregation}()"
 
     comp_ids = _compartment_ids_for_tool(
         compartment_id,
@@ -3126,7 +3478,7 @@ def get_recovery_service_metrics(
                 query=query,
                 start_time=start_time,
                 end_time=end_time,
-                resolution=resolution,
+                resolution=metric_resolution,
             ),
         ).data
 
@@ -3154,6 +3506,7 @@ def get_recovery_service_metrics(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Lists databases in a DB Home or, if none is given, across all DB Homes in a "
         "compartment. It can find DB Homes for you, fills in backup settings only when "
@@ -3193,7 +3546,7 @@ def list_databases(
             compartment_id = _resolve_compartment_id(compartment_id)
 
         # Determine compartment scope
-        comp_ids: list[str] = []
+        comp_ids: list[Optional[str]] = []
         if db_home_id is None:
             if not compartment_id:
                 raise ValueError(
@@ -3206,7 +3559,9 @@ def list_databases(
             )
         else:
             # db_home_id is explicit: keep existing behavior and don't expand compartments
-            comp_ids = [compartment_id] if compartment_id else []
+            # A compartment is not required by the OCI list_databases API when
+            # the DB Home has already been supplied.
+            comp_ids = [compartment_id]
 
         results: list[DatabaseSummary] = []
 
@@ -3225,8 +3580,26 @@ def list_databases(
                     if fetch_for_child_compartment
                     else [compartment_id]
                 )
+            except Exception as e:
+                # No Recovery client or no compartment scope: every database is
+                # returned without a policy link, which is the best that can be done.
+                _log_event(
+                    "protection_policy_enrichment_unavailable",
+                    request_id=request_id,
+                    tool="list_databases",
+                    payload={"error": str(e)},
+                    level=logging.WARNING,
+                )
+                pd_comp_ids = []
 
-                for pd_comp_id in pd_comp_ids:
+            skipped: list[str] = []
+            for pd_comp_id in pd_comp_ids:
+                # Scoped per compartment on purpose. A caller who cannot list
+                # protected databases in one compartment of a subtree gets a 404
+                # there; failing the whole correlation would strip the policy link
+                # off every database in every *readable* compartment too, which
+                # reads as "no protection policy" rather than "could not check".
+                try:
                     has_next = True
                     next_page = None
                     while has_next:
@@ -3236,7 +3609,6 @@ def list_databases(
                         pdata = lp.data
                         pitems = getattr(pdata, "items", pdata)
                         for it in pitems or []:
-                            logger.debug(f"Item structure: {it}")
                             try:
                                 if hasattr(oci, "util") and hasattr(oci.util, "to_dict"):
                                     d = oci.util.to_dict(it)
@@ -3248,8 +3620,23 @@ def list_databases(
                             ppid = d.get("protectionPolicyId") or d.get("protection_policy_id")
                             if dbid and ppid and dbid not in pd_policy_by_dbid:
                                 pd_policy_by_dbid[dbid] = ppid
-            except Exception:
-                pd_policy_by_dbid = {}
+                except Exception as e:
+                    skipped.append(pd_comp_id)
+                    _log_event(
+                        "protection_policy_enrichment_skipped_compartment",
+                        request_id=request_id,
+                        tool="list_databases",
+                        payload={"compartment_id": pd_comp_id, "error": str(e)},
+                        level=logging.WARNING,
+                    )
+
+            if skipped:
+                logger.warning(
+                    "Protection policy correlation skipped %s of %s compartments the caller "
+                    "cannot read; databases in those compartments have no protectionPolicyId.",
+                    len(skipped),
+                    len(pd_comp_ids),
+                )
 
         # Common list_databases filters shared across DB Homes
         common_kwargs: dict = {}
@@ -3269,7 +3656,7 @@ def list_databases(
             common_kwargs["db_name"] = db_name
 
         # Iterate compartments -> DB homes -> list databases
-        for each_comp in comp_ids or [compartment_id] if compartment_id else []:
+        for each_comp in comp_ids:
             # Determine DB Home scope for this compartment:
             # - If db_home_id not provided, discover all DB Homes in the compartment.
             # - If provided, just use that one.
@@ -3353,6 +3740,7 @@ def list_databases(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Gets a database by OCID and returns an easy object. Where possible, it also "
         "links the database to its protection policy. The result is one database."
@@ -3418,6 +3806,7 @@ def get_database(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Finds database restore requests and returns only active or historical restore jobs."
         "Use this when answering customer questions about database restore status, "
@@ -3435,12 +3824,18 @@ def list_restore(
         Optional[str], "Optional resource OCID to scope work requests (e.g., Database OCID)."
     ] = None,
     status: Annotated[
-        Optional[str], "Optional work request status filter (e.g., IN_PROGRESS, SUCCEEDED, FAILED)."
+        Optional[str],
+        "Optional work request status filter (e.g., IN_PROGRESS, SUCCEEDED, FAILED). "
+        "Applied to the returned restore work requests.",
     ] = None,
     limit: Annotated[Optional[int], "Maximum number of items per backend page."] = None,
     page: Annotated[Optional[str], "Pagination token (opc-next-page) when aggregate_pages=false."] = None,
-    sort_order: Annotated[Optional[str], 'Sort order: "ASC" or "DESC".'] = None,
-    sort_by: Annotated[Optional[str], "Sort by field when supported by the API."] = None,
+    sort_order: Annotated[Optional[str], 'Sort order: "ASC" or "DESC". Default "DESC".'] = None,
+    sort_by: Annotated[
+        Optional[str],
+        "Sort the returned restore work requests by one of: timeAccepted, timeStarted, "
+        "timeFinished, status, operationType.",
+    ] = None,
     opc_request_id: Annotated[Optional[str], "Unique identifier for the request"] = None,
     region: Annotated[Optional[str], "Canonical OCI region (e.g., us-phoenix-1)."] = None,
     aggregate_pages: Annotated[bool, "When true (default), retrieves all pages."] = True,
@@ -3475,12 +3870,11 @@ def list_restore(
                 }
                 if resource_id is not None:
                     kwargs["resource_id"] = resource_id
-                if status is not None:
-                    kwargs["status"] = status
-                if sort_order is not None:
-                    kwargs["sort_order"] = sort_order
-                if sort_by is not None:
-                    kwargs["sort_by"] = sort_by
+                # status/sort_by/sort_order are deliberately NOT forwarded:
+                # oci.work_requests.WorkRequestClient.list_work_requests accepts only
+                # resource_id, limit, page and opc_request_id, and raises ValueError on
+                # anything else. They are applied to the results below instead, the same
+                # way this tool already filters by operation type.
                 if opc_request_id is not None:
                     kwargs["opc_request_id"] = opc_request_id
                 if limit is not None:
@@ -3498,8 +3892,13 @@ def list_restore(
                     mapped = map_work_request(item)
                     if mapped is None:
                         continue
-                    if _is_restore_operation(getattr(mapped, "operation_type", None)):
-                        results.append(mapped)
+                    if not _is_restore_operation(getattr(mapped, "operation_type", None)):
+                        continue
+                    if status is not None and str(
+                        getattr(mapped, "status", "") or ""
+                    ).strip().upper() != status.strip().upper():
+                        continue
+                    results.append(mapped)
 
                 has_next = bool(getattr(response, "has_next_page", False))
                 next_page = getattr(response, "next_page", None) if has_next else None
@@ -3514,13 +3913,14 @@ def list_restore(
                     uniq[rid] = r
             results = list(uniq.values())
 
-        return results
+        return _sorted_work_requests(results, sort_by, sort_order)
     except Exception as e:
         logger.error("Error in list_restore tool: %s", e)
         raise
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Lists database backups with flexible filters and optional auto-paging. If "
         "database_id is provided, lists all backups for that database. If compartment_id "
@@ -3778,6 +4178,7 @@ def list_backups(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Gets a database backup by OCID and returns a clean dictionary. It includes "
         "common fields like database size, backup destination, and the database's "
@@ -3934,6 +4335,7 @@ def get_backup(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Summarizes how databases in a compartment or DB Home are backed up. It can "
         "find DB Homes, looks at each database’s backup settings, can include the time "
@@ -4316,6 +4718,7 @@ def summarize_protected_database_backup_destination(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Lists database homes in a compartment with optional lifecycle filters, "
         "defaulting to your tenancy when no compartment is given, and handles paging "
@@ -4391,6 +4794,7 @@ def list_db_homes(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Gets a database home by OCID and returns it as a simple object. The result is one database home."
     )
@@ -4411,6 +4815,7 @@ def get_db_home(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Lists database systems in a compartment with optional lifecycle filters, "
         "defaulting to your tenancy when no compartment is given, and handles paging "
@@ -4483,6 +4888,7 @@ def list_db_systems(
 
 
 @mcp.tool(
+    annotations=_READ_ONLY_TOOL,
     description=(
         "Gets a database system by OCID and returns it as a convenient object. The "
         "result is one database system."
@@ -4504,30 +4910,36 @@ def get_db_system(
 
 
 @mcp.tool(
+    annotations=_LOCAL_GUIDANCE_TOOL,
     description=(
         "Returns dashboard-generation guidance for OCI Recovery Service, including "
         "cloud-protected databases."
     )
 )
+@_tool_logger("oci_recovery_service_dashboard_prompt")
 def oci_recovery_service_dashboard_prompt() -> str:
     """Return dashboard-generation guidance as a tool for clients without prompt support."""
     return OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT
 
 
 @mcp.tool(
+    annotations=_LOCAL_GUIDANCE_TOOL,
     description=(
         "Always call this tool first when a user asks to onboard, protect, enable Recovery Service backups for, or register a database to Recovery Service. The tool first determines and verifies whether the target database is OCI DBaaS or purely on-premises, retrieves the latest Oracle requirements, and performs only the read-only prerequisite checks appropriate for that deployment type. For OCI DBaaS, it configures DBRS automatic backups using the current UpdateDatabase / DbBackupConfig contract, then independently verifies the protected database, assigned policy, health status, and initial backup. For on-premises databases, it proceeds with the Cloud Protect workflow only after the deployment type has been verified and the required approval has been obtained."
     )
 )
+@_tool_logger("onboard_database_to_recovery_service")
 def onboard_database_to_recovery_service() -> str:
     return ONBOARD_DATABASE_TO_RECOVERY_SERVICE_PROMPT
 
 
 @mcp.tool(
+    annotations=_LOCAL_GUIDANCE_TOOL,
     description=(
         "Use this tool first whenever the user's underlying goal is to investigate, explain, or assess the health of Oracle Database backup, protection, or recoverability in an environment using Recovery Service. This includes explicit failures as well as implicit concerns such as unexpected backup behavior, stale or missing backups, protection lag, missing recovery points, restore/PITR problems, policy or retention behavior, RMAN issues, or questions about whether a protected database is healthy and recoverable. Also use it when the user asks whether anything is wrong with the protection environment, even without reporting an error. The tool provides an evidence-driven, access-first diagnostic workflow that traces the actual execution path, acquires relevant evidence, tests competing root-cause hypotheses, independently assesses recoverability, and guides safe remediation and verification. Do not use it for general database questions unrelated to backup, recovery, protection, or recoverability."
     )
 )
+@_tool_logger("diagnose_recovery_service_issue")
 def diagnose_recovery_service_issue() -> str:
     """Return Recovery Service diagnostic guidance as a tool for clients without prompt support."""
     return DIAGNOSE_RECOVERY_SERVICE_ISSUE_PROMPT
@@ -4537,27 +4949,37 @@ def main():
     # Entrypoint: choose transport based on env; always log startup meta and log file location
     global _http_auth
 
-    host = os.getenv("ORACLE_MCP_HOST")
-    port = os.getenv("ORACLE_MCP_PORT")
+    host = (os.getenv("ORACLE_MCP_HOST") or "").strip()
+    port = (os.getenv("ORACLE_MCP_PORT") or "").strip()
 
-    # Log startup and where logs are written
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-    log_dir = os.getenv("ORACLE_MCP_LOG_DIR", os.path.join(base_dir, "logs"))
-    log_file = os.getenv("ORACLE_MCP_LOG_FILE", os.path.join(log_dir, "oci_recovery_mcp_server.log"))
+    # Log startup and where logs are actually going (stderr if the file could
+    # not be opened, so the line never points at a file that does not exist).
     logger.info("Starting %s v%s", __project__, __version__)
-    logger.info("Logs will be written to: %s", os.path.abspath(log_file))
+    logger.info("Logs will be written to: %s", _LOG_DESTINATION)
 
-    if not (host and port):
+    if bool(host) != bool(port):
+        raise ValueError(
+            "ORACLE_MCP_HOST and ORACLE_MCP_PORT must either both be set or both be unset."
+        )
+
+    if not host:
         logger.info("Running FastMCP over stdio transport (auth_type=%s)", _resolved_auth_type_label())
         mcp.run()
         return
+
+    try:
+        port_number = int(port)
+    except ValueError as exc:
+        raise ValueError("ORACLE_MCP_PORT must be an integer from 1 to 65535.") from exc
+    if not 1 <= port_number <= 65535:
+        raise ValueError("ORACLE_MCP_PORT must be an integer from 1 to 65535.")
 
     # HTTP transport authenticates every caller against an OCI IAM (IDCS) domain;
     # local profile credentials are never used to serve a network listener.
     logger.info("Running FastMCP over streamable HTTP with OCI IAM OAuth at http://%s:%s", host, port)
     _http_auth = _build_http_auth()
     mcp.auth = _http_auth.provider
-    mcp.run(transport="http", host=host, port=int(port))
+    mcp.run(transport="http", host=host, port=port_number)
 
 
 if __name__ == "__main__":

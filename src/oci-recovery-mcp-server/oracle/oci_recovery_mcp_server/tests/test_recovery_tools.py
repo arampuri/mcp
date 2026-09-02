@@ -295,14 +295,21 @@ def _fake_oci_provider(captured):
         _cimd_manager = object()
 
         def __init__(self, **kwargs):
-            # required_scopes is the upstream authorize fallback and is rewritten
-            # with the qualified scopes; the verifier's own copy stays bare.
-            self.required_scopes: list[str] = []
+            # The real provider seeds required_scopes from the verifier's copy, and
+            # FastMCP hands this same list to RequireAuthMiddleware, so it has to
+            # stay bare.
+            self.required_scopes: list[str] = list(kwargs.get("required_scopes") or [])
             captured.update(kwargs)
             captured["provider"] = self
 
         def update_default_scopes(self, scopes):
             captured["default_scopes"] = list(scopes)
+
+        def _build_upstream_authorize_url(self, txn_id, transaction):
+            # Stands in for the real URL builder: only the scopes it was handed
+            # matter here.
+            captured["authorize_scopes"] = list(transaction.get("scopes") or [])
+            return f"https://idcs.example.com/authorize?state={txn_id}"
 
         def _prepare_scopes_for_upstream_refresh(self, scopes):
             return scopes
@@ -352,6 +359,40 @@ class TestHttpTransportAuth:
         server._build_profile_auth_context()
         assert captured["args"] == ()  # nothing forced; the library decides
         assert server._resolved_auth_type_label() == "auto"
+
+    def test_canonical_auth_type_outranks_the_deprecated_spelling(self, monkeypatch):
+        # The translated value is passed as an explicit AuthOptions, which outranks
+        # every environment variable inside resolve_auth_type(). Applying it while
+        # OCI_MCP_AUTH_TYPE is set would let the deprecated name win -- and
+        # security_token + apikey would then sign requests with the profile's API
+        # key, which OCI rejects with 401 after a apparently successful startup.
+        captured = {}
+
+        def fake_build_auth_context(*args):
+            captured["args"] = args
+            return SimpleNamespace(config={}, signer=object())
+
+        monkeypatch.setattr(
+            "oracle.oci_recovery_mcp_server.server.build_auth_context",
+            fake_build_auth_context,
+        )
+        monkeypatch.setenv("ORACLE_MCP_AUTH_METHOD", "apikey")
+
+        for canonical in server._CANONICAL_AUTH_TYPE_ENV:
+            for name in server._CANONICAL_AUTH_TYPE_ENV:
+                monkeypatch.delenv(name, raising=False)
+            monkeypatch.setenv(canonical, "security_token")
+
+            assert server._deprecated_auth_method_override() is None
+            server._build_profile_auth_context()
+            assert captured["args"] == ()  # the library resolves security_token
+            assert server._resolved_auth_type_label() == "security_token"
+
+        # With no canonical variable set, the deprecated spelling still works.
+        for name in server._CANONICAL_AUTH_TYPE_ENV:
+            monkeypatch.delenv(name, raising=False)
+        server._build_profile_auth_context()
+        assert captured["args"][0].auth_type is server.AuthType.API_KEY
 
     def test_default_scopes_gate_on_the_recovery_invoke_scope(self, monkeypatch):
         monkeypatch.delenv("IDCS_REQUIRED_SCOPES", raising=False)
@@ -613,8 +654,9 @@ class TestHttpTransportAuth:
 
     def test_resource_scopes_are_qualified_with_the_audience_upstream(self, monkeypatch):
         # IDCS names a resource scope as audience+scope with no separator and
-        # rejects the bare form at /authorize with invalid_scope. Every surface
-        # that reaches IDCS must carry the qualified form; the verifier must not.
+        # rejects the bare form at /authorize with invalid_scope. Every surface that
+        # reaches IDCS must carry the qualified form; everything compared against an
+        # issued token must not.
         self._idcs_env(monkeypatch)
         monkeypatch.setenv(
             "IDCS_REQUIRED_SCOPES", "openid offline_access oci_mcp.recovery.invoke"
@@ -625,11 +667,16 @@ class TestHttpTransportAuth:
             auth = server._build_http_auth()
 
         provider = auth.provider
+        bare = ["openid", "offline_access", "oci_mcp.recovery.invoke"]
         qualified = "https://recovery.example.comoci_mcp.recovery.invoke"
         # advertised to clients (DCR defaults, valid_scopes, metadata)
         assert captured["default_scopes"] == ["openid", "offline_access", qualified]
-        # the fallback used when a client sends no scope parameter at all
-        assert provider.required_scopes == ["openid", "offline_access", qualified]
+        # the /authorize request itself, built from what the client asked for
+        provider._build_upstream_authorize_url("txn", {"scopes": list(bare)})
+        assert captured["authorize_scopes"] == ["openid", "offline_access", qualified]
+        # and from required_scopes when the client sends no scope parameter at all
+        provider._build_upstream_authorize_url("txn", {})
+        assert captured["authorize_scopes"] == ["openid", "offline_access", qualified]
         # and the refresh request, which is built from the bare scopes IDCS stored
         assert provider._prepare_scopes_for_upstream_refresh(
             ["openid", "oci_mcp.recovery.invoke"]
@@ -640,12 +687,26 @@ class TestHttpTransportAuth:
             "offline_access",
             qualified,
         ]
-        # reserved IDCS scopes are never namespaced
-        assert captured["required_scopes"] == [
-            "openid",
-            "offline_access",
-            "oci_mcp.recovery.invoke",
-        ]
+        # the verifier's copy stays bare: IDCS returns the scope unqualified in the
+        # access token, and that is what every request is re-validated against
+        assert captured["required_scopes"] == bare
+
+    def test_request_time_scope_checks_are_left_bare(self, monkeypatch):
+        # FastMCP builds its transport routes from the *provider's* required_scopes
+        # (fastmcp/server/http.py) and hands them to RequireAuthMiddleware, which
+        # compares them to the bare scope claim of the IDCS access token. Qualifying
+        # this list would return insufficient_scope on every request of a session
+        # that signed in successfully.
+        self._idcs_env(monkeypatch)
+        monkeypatch.setenv(
+            "IDCS_REQUIRED_SCOPES", "openid offline_access oci_mcp.recovery.invoke"
+        )
+        captured = {}
+
+        with patch("oracle_mcp_common.auth.OCIProvider", _fake_oci_provider(captured)):
+            auth = server._build_http_auth()
+
+        assert auth.provider.required_scopes == list(captured["required_scopes"])
 
     def test_startup_fails_if_fastmcp_drops_a_scope_hook(self, monkeypatch):
         # Silently skipping the qualification would fail every sign-in with
@@ -682,6 +743,9 @@ class TestHttpTransportAuth:
 
             def update_default_scopes(self, scopes):
                 pass
+
+            def _build_upstream_authorize_url(self, txn_id, transaction):
+                return ""
 
             def _prepare_scopes_for_upstream_refresh(self, scopes):
                 return scopes
@@ -1306,7 +1370,7 @@ class TestRecoveryTools:
                     "metricName": "SpaceUsedForRecoveryWindow",
                     "resolution": "1m",
                     "aggregation": "mean",
-                    "protected_database_id": "pd1",
+                    "protected_database_id": "ocid1.protecteddatabase.oc1.iad.pd1",
                 },
             )
             result = call_tool_result.structured_content["result"]
@@ -1684,8 +1748,9 @@ class TestServer:
 
         import oracle.oci_recovery_mcp_server.server as server
 
-        server.main()
-        mock_mcp_run.assert_called_once_with()
+        with pytest.raises(ValueError, match="must either both be set or both be unset"):
+            server.main()
+        mock_mcp_run.assert_not_called()
 
     @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
     @patch("os.getenv")
@@ -1695,8 +1760,22 @@ class TestServer:
 
         import oracle.oci_recovery_mcp_server.server as server
 
-        server.main()
-        mock_mcp_run.assert_called_once_with()
+        with pytest.raises(ValueError, match="must either both be set or both be unset"):
+            server.main()
+        mock_mcp_run.assert_not_called()
+
+    @pytest.mark.parametrize("port", ["not-a-port", "0", "65536"])
+    @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
+    @patch("os.getenv")
+    def test_main_rejects_invalid_http_port(self, mock_getenv, mock_mcp_run, port):
+        mock_env = {"ORACLE_MCP_HOST": "127.0.0.1", "ORACLE_MCP_PORT": port}
+        mock_getenv.side_effect = lambda k, d=None: mock_env.get(k, d)
+
+        import oracle.oci_recovery_mcp_server.server as server
+
+        with pytest.raises(ValueError, match="integer from 1 to 65535"):
+            server.main()
+        mock_mcp_run.assert_not_called()
 
     @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
     @patch("os.getenv")
@@ -1715,3 +1794,61 @@ class TestServer:
                 server.main()
         mock_mcp_run.assert_called_once_with(transport="http", host="0.0.0.0", port=9001)
         server._http_auth = None
+
+
+class TestToolContract:
+    """The tool surface a client sees before it calls anything."""
+
+    @pytest.mark.asyncio
+    async def test_every_tool_declares_itself_read_only(self):
+        # The server's central claim -- that it never creates, updates or deletes
+        # an OCI resource -- is only in the README otherwise, where a host cannot
+        # act on it.
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+
+        assert len(tools) == 25
+        for tool in tools:
+            annotations = tool.annotations
+            assert annotations is not None, f"{tool.name} declares no annotations"
+            assert annotations.readOnlyHint is True, tool.name
+            assert annotations.destructiveHint is False, tool.name
+            assert annotations.idempotentHint is True, tool.name
+
+        # The guidance tools return static text and never reach the network.
+        local = {
+            "oci_recovery_service_dashboard_prompt",
+            "onboard_database_to_recovery_service",
+            "diagnose_recovery_service_issue",
+        }
+        for tool in tools:
+            expected = tool.name not in local
+            assert tool.annotations.openWorldHint is expected, tool.name
+
+    @pytest.mark.asyncio
+    async def test_summary_tools_advertise_the_shape_they_return(self, monkeypatch):
+        # These two declared a counts model but returned a wrapper around it, so
+        # any client trusting outputSchema was given the wrong contract.
+        recovery_client = MagicMock()
+        monkeypatch.setattr(
+            server, "get_recovery_client", lambda region=None, request_id=None: recovery_client
+        )
+        monkeypatch.setattr(
+            server, "_resolve_compartment_id", lambda compartment_id, **_kwargs: compartment_id
+        )
+        monkeypatch.setattr(server, "_compartment_ids_for_tool", lambda cid, **_kwargs: [cid])
+        recovery_client.list_protected_databases.return_value = SimpleNamespace(
+            data=SimpleNamespace(items=[]), has_next_page=False, next_page=None
+        )
+
+        async with Client(mcp) as client:
+            tools = {tool.name: tool for tool in await client.list_tools()}
+            for name in (
+                "summarize_protected_database_health",
+                "summarize_protected_database_redo_status",
+            ):
+                declared = set(tools[name].outputSchema["properties"])
+                result = await client.call_tool(
+                    name, {"compartment_id": "ocid1.compartment.oc1..c"}
+                )
+                assert set(result.structured_content) == declared, name
