@@ -61,6 +61,7 @@ def test_summary_tools_fall_back_on_counts_and_metrics(monkeypatch):
         "alert": 1,
         "unknown": 1,
         "total": 3,
+        "partial": False,
     }
     assert [c.model_dump(by_alias=True) for c in health.per_compartment] == [
         {
@@ -71,6 +72,7 @@ def test_summary_tools_fall_back_on_counts_and_metrics(monkeypatch):
             "alert": 1,
             "unknown": 1,
             "total": 3,
+            "partial": False,
         }
     ]
     assert health.compartment_ids_scanned == ["tenancy"]
@@ -95,16 +97,19 @@ def test_summary_tools_fall_back_on_counts_and_metrics(monkeypatch):
     )
     # The fourth entry has no id, so its redo status cannot be read at all. It is
     # reported as unknown rather than dropped, which would have made a database
-    # nobody could see look like one that simply is not counted.
+    # nobody could see look like one that simply is not counted. total counts the
+    # databases in scope, so it includes that one; the scan ran to completion, so
+    # nothing is flagged partial.
     assert redo.aggregated.model_dump(by_alias=True) == {
         "compartmentId": "compartment",
         "region": "us-ashburn-1",
         "enabled": 2,
         "disabled": 1,
         "unknown": 1,
-        "total": 3,
+        "total": 4,
+        "partial": False,
     }
-    assert redo.per_compartment[0].total == 3
+    assert redo.per_compartment[0].total == 4
     assert redo.per_compartment[0].unknown == 1
 
     recovery_client.list_protected_databases.return_value = _response(
@@ -164,6 +169,7 @@ def test_summary_serialization_fallbacks_and_error_paths(monkeypatch):
         "alert": 0,
         "unknown": 0,
         "total": 0,
+        "partial": False,
     }
 
     redo = server.summarize_protected_database_redo_status("compartment")
@@ -175,6 +181,7 @@ def test_summary_serialization_fallbacks_and_error_paths(monkeypatch):
         "disabled": 0,
         "unknown": 0,
         "total": 0,
+        "partial": False,
     }
 
     recovery_client.list_protected_databases.side_effect = RuntimeError("service down")
@@ -391,6 +398,12 @@ def test_summary_scans_stop_at_their_deadline_and_say_so(monkeypatch):
     assert redo.compartment_ids_scanned == ["c1"]
     assert len(redo.per_compartment) == 1
     assert recovery_client.get_protected_database.call_count == 1
+    # c1 was entered but only half read: it holds two databases and only one was
+    # fetched. Its counts stay in the report -- dropping them would hide the work
+    # that was done -- but they are flagged, so a caller cannot mistake a
+    # half-scanned compartment for one that really contains a single database.
+    assert redo.per_compartment[0].partial is True
+    assert redo.per_compartment[0].total == 1
 
 
 def test_summary_scans_report_every_compartment_when_they_finish(monkeypatch):
@@ -418,3 +431,4 @@ def test_summary_scans_report_every_compartment_when_they_finish(monkeypatch):
     health = server.summarize_protected_database_health(compartment_id="root")
     assert health.truncated is False
     assert health.compartment_ids_scanned == ["c1", "c2"]
+    assert [c.partial for c in health.per_compartment] == [False, False]

@@ -2530,6 +2530,11 @@ def summarize_protected_database_health(
                     "alert": c_alert,
                     "unknown": c_unknown,
                     "total": c_scanned,
+                    # Only the compartment in flight when the budget ran out can be
+                    # short, because the outer loop breaks on the next iteration.
+                    # Without this, a partial compartment is indistinguishable from
+                    # one that genuinely holds that few databases.
+                    "partial": deadline.expired,
                 }
             )
 
@@ -2582,8 +2587,9 @@ def summarize_protected_database_health(
         "Use this tool for real-time protection status questions. It shows how many "
         "protected databases have redo transport (real-time protection) turned on or "
         "off in a compartment. It reads the main setting and uses a fallback when "
-        "needed. The result is a simple JSON with enabled, disabled, total, the "
-        "compartmentId, and the region."
+        "needed. The result is a simple JSON with enabled, disabled, unknown (the "
+        "databases whose setting could not be read), total (all three, i.e. the "
+        "databases in scope), the compartmentId, and the region."
     )
 )
 @_tool_logger("summarize_protected_database_redo_status")
@@ -2713,11 +2719,18 @@ def summarize_protected_database_redo_status(
                     "enabled": c_enabled,
                     "disabled": c_disabled,
                     "unknown": c_unknown,
-                    "total": c_enabled + c_disabled,
+                    # total is "databases in scope", so the unreadable ones are in it
+                    # -- the same meaning total carries in the health summary. Leaving
+                    # them out made a scan with a permissions gap report a smaller
+                    # fleet than the caller actually has.
+                    "total": c_enabled + c_disabled + c_unknown,
+                    # Only the compartment in flight when the budget ran out can be
+                    # short, because the outer loop breaks on the next iteration.
+                    "partial": deadline.expired,
                 }
             )
 
-        total = enabled + disabled
+        total = enabled + disabled + unknown
         logger.info(
             "Redo transport summary for compartment %s (region=%s): "
             "ENABLED=%s, DISABLED=%s, UNKNOWN=%s, TOTAL=%s",

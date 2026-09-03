@@ -1830,7 +1830,9 @@ class TestRecoveryTools:
         agg = result["aggregated"]
         assert agg["enabled"] == 0
         assert agg["disabled"] == 0
-        assert agg["total"] == 0
+        assert agg["unknown"] == 1
+        # In scope but unreadable: it stays in total so the fleet size is right.
+        assert agg["total"] == 1
 
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_tenancy")

@@ -105,6 +105,14 @@ class ProtectedDatabaseHealthCounts(OCIBaseModel):
         ),
     )
     total: int = Field(0, alias="total", description="Total Protected Databases scanned.")
+    partial: bool = Field(
+        False,
+        alias="partial",
+        description=(
+            "True when the deadline stopped this scan part-way, so these counts cover only "
+            "some of the compartment's protected databases."
+        ),
+    )
 
 
 class ProtectedDatabaseRedoCounts(OCIBaseModel):
@@ -143,7 +151,19 @@ class ProtectedDatabaseRedoCounts(OCIBaseModel):
     total: int = Field(
         0,
         alias="total",
-        description="Total counted (enabled + disabled); see unknown for those that could not be read.",
+        description=(
+            "Total Protected Databases scanned (enabled + disabled + unknown). It answers "
+            "\"how many databases are in scope\", so the ones that could not be read are "
+            "included here and counted separately under unknown."
+        ),
+    )
+    partial: bool = Field(
+        False,
+        alias="partial",
+        description=(
+            "True when the deadline stopped this scan part-way, so these counts cover only "
+            "some of the compartment's protected databases."
+        ),
     )
 
 
