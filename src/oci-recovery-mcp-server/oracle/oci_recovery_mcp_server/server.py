@@ -189,6 +189,7 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
     """
 
     def _open(self):
+        """Open the next log file and tighten its mode to owner-only."""
         stream = super()._open()
         try:
             os.chmod(self.baseFilename, 0o600)
@@ -200,6 +201,19 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
 
 
 def setup_logging():
+    """
+    Configure root logging for the server: level, rotating file handler, console.
+
+    Called once at import, before any tool runs. File logging is best effort --
+    when the log file cannot be opened the server keeps running and falls back to
+    stderr -- so a read-only or full filesystem never blocks startup.
+
+    Environment:
+    - ORACLE_MCP_LOG_LEVEL: root level (default INFO).
+    - ORACLE_MCP_LOG_TO_STDOUT: add a console handler (writes to stderr, so it is
+      safe under stdio transport). Forced on when file logging is unavailable.
+    - ORACLE_SDK_LOG_LEVEL: level for the noisy ``oci`` logger (default WARNING).
+    """
     global _LOG_DESTINATION
 
     # Resolve log level from env, default to INFO
@@ -311,6 +325,7 @@ _LOG_REDACT_KEYS = {
 
 
 def _truncate_str(s: str) -> str:
+    """Cap a string at ORACLE_MCP_LOG_MAX_VALUE_CHARS, noting the original length."""
     if _LOG_MAX_VALUE_CHARS and len(s) > _LOG_MAX_VALUE_CHARS:
         return s[:_LOG_MAX_VALUE_CHARS] + f"...(truncated,len={len(s)})"
     return s
@@ -341,6 +356,15 @@ def _log_full_payloads() -> bool:
 
 
 def _safe_jsonable(obj: Any) -> Any:
+    """
+    Convert an arbitrary value into something ``json.dumps`` can render.
+
+    Walks containers recursively, redacting any key whose name matches
+    _LOG_REDACT_KEYS, and unwraps OCI SDK models and pydantic models to plain
+    dicts. Every conversion is best effort: a value that resists all of them
+    degrades to a truncated ``repr``, and a value that raises becomes
+    ``"<unserializable>"``, because logging must never fail a tool call.
+    """
     try:
         if obj is None or isinstance(obj, (bool, int, float, str)):
             return _truncate_str(obj) if isinstance(obj, str) else obj
@@ -395,6 +419,14 @@ def _log_event(
     payload: Optional[dict[str, Any]] = None,
     level: int = logging.INFO,
 ):
+    """
+    Emit one structured log record as a single line of JSON.
+
+    ``request_id`` correlates the record with the other events of the same tool
+    call and with the ``opc-request-id`` sent to OCI. ``payload`` is passed through
+    _safe_jsonable, so callers may hand it SDK objects directly. Falls back to a
+    plain ``str`` rendering if the record will not serialize.
+    """
     rec = {
         "event": event,
         "request_id": request_id,
@@ -570,6 +602,7 @@ def _install_opc_request_id_fallback(client: Any, request_id: str) -> None:
     marker = _mcp_opc_request_id(request_id)
 
     def _call_api(*args, **kwargs):
+        """Stand in for ``BaseClient.call_api`` and stamp the request-id header."""
         # Generated OCI operations pass header_params to BaseClient.call_api. Adding
         # the header here avoids unsupported operation kwargs and does not enable
         # the SDK's process-wide request-id propagation state.
@@ -587,11 +620,20 @@ def _wrap_oci_client(client: Any, *, request_id: str, client_name: str):
     _install_opc_request_id_fallback(client, request_id)
 
     class _Proxy:
+        """Attribute-forwarding wrapper around one OCI SDK client."""
+
         def __init__(self, inner: Any):
+            """Wrap ``inner`` and start an empty per-method opc_request_id support cache."""
             self._inner = inner
             self._opc_request_id_support: dict[str, bool] = {}
 
         def __getattr__(self, name: str):
+            """
+            Return non-callables untouched; wrap SDK operations in a logging shim.
+
+            Whether an operation accepts an ``opc_request_id`` kwarg is decided by reading
+            its source, which is expensive, so the answer is cached per method name.
+            """
             attr = getattr(self._inner, name)
             if not callable(attr):
                 return attr
@@ -602,6 +644,13 @@ def _wrap_oci_client(client: Any, *, request_id: str, client_name: str):
             supports_opc_request_id = self._opc_request_id_support[name]
 
             def _call(*args, **kwargs):
+                """
+                Invoke the SDK operation, logging start, end and error events.
+
+                Response metadata (status, headers, paging) is logged at INFO; the response
+                body follows the same rule as tool results -- its shape at INFO, its content
+                only at DEBUG. Exceptions are logged with a traceback and re-raised.
+                """
                 kwargs = dict(kwargs)
                 if supports_opc_request_id:
                     kwargs["opc_request_id"] = _mcp_opc_request_id(kwargs.get("opc_request_id") or request_id)
@@ -693,8 +742,11 @@ def _tool_logger(tool_name: str):
     R = TypeVar("R")
 
     def _decorator(fn: Callable[P, R]) -> Callable[P, R]:
+        """Wrap one tool function, preserving its signature for FastMCP."""
+
         @wraps(fn)
         def _wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            """Log the call's start, end and any error, then return the tool's result."""
             request_id = uuid.uuid4().hex
             start = time.time()
             actor_id_token = _MCP_ACTOR_ID_CONTEXT.set(_mcp_actor_id())
@@ -1168,6 +1220,12 @@ def get_recovery_client(
 
 
 def get_identity_client(*, request_id: Optional[str] = None):
+    """
+    Create an OCI Identity client using auth selected via env vars.
+
+    Always built for the home region: IAM compartments and region subscriptions
+    are tenancy-wide, so there is no region to pass.
+    """
     return _make_client(
         oci.identity.IdentityClient,
         None,
@@ -1177,6 +1235,7 @@ def get_identity_client(*, request_id: Optional[str] = None):
 
 
 def get_database_client(region: str | None = None, *, request_id: Optional[str] = None):
+    """Create an OCI Database client using auth selected via env vars."""
     return _make_client(
         oci.database.DatabaseClient,
         region,
@@ -1196,6 +1255,7 @@ def get_work_request_client(region: str | None = None, *, request_id: Optional[s
 
 
 def get_monitoring_client(region: str | None = None, *, request_id: Optional[str] = None):
+    """Create an OCI Monitoring client using auth selected via env vars."""
     logger.info("entering get_monitoring_client")
     return _make_client(
         oci.monitoring.MonitoringClient,
@@ -1299,11 +1359,17 @@ class _Deadline:
     """
 
     def __init__(self, seconds: Optional[float] = None):
+        """
+        Start the budget, defaulting to ORACLE_MCP_TOOL_DEADLINE_SECONDS.
+
+        A budget of 0 (or None resolving to 0) means no deadline at all.
+        """
         budget = _TOOL_DEADLINE_SECONDS if seconds is None else seconds
         self._expires_at = (time.monotonic() + budget) if budget and budget > 0 else None
         self.expired = False
 
     def reached(self) -> bool:
+        """Report whether the budget is spent, latching ``expired`` once it is."""
         if self._expires_at is not None and time.monotonic() >= self._expires_at:
             self.expired = True
         return self.expired
@@ -1387,6 +1453,12 @@ def _iam_subscribed_regions_with_status(*, request_id: str) -> list[dict]:
 
 
 def get_tenancy():
+    """
+    Return the OCID of the tenancy this server serves.
+
+    Under HTTP transport the env override is the only source, since a hosted
+    deployment has no local OCI config file to read a tenancy from.
+    """
     # An explicit override always wins. Over HTTP it is the only source: there is
     # no local OCI config file on a hosted deployment to read a tenancy from.
     override = _first_env("TENANCY_ID_OVERRIDE", "ORACLE_MCP_TENANCY_ID")
@@ -1743,6 +1815,7 @@ def get_compartment_by_name(compartment_name: str):
 
 
 def _looks_like_ocid(value: Optional[str]) -> bool:
+    """Report whether a value is shaped like an OCID rather than a display name."""
     return bool(value and isinstance(value, str) and value.strip().lower().startswith("ocid1."))
 
 
@@ -2093,6 +2166,7 @@ def list_protected_databases(
                                             md = None
 
                                 def _pick(d: dict | None, key: str):
+                                    """Read one key from a metrics dict that may be missing entirely."""
                                     if not isinstance(d, dict):
                                         return None
                                     return d.get(key)
@@ -2290,6 +2364,7 @@ def get_protected_database(
                     metrics_dict = None
 
         def _pick(d: dict | None, key: str):
+            """Read one key from a metrics dict that may be missing entirely."""
             if not isinstance(d, dict):
                 return None
             return d.get(key)
@@ -2932,6 +3007,7 @@ def check_recovery_service_limits(
         }
 
         def _as_dict(obj: Any) -> dict[str, Any]:
+            """Best-effort conversion of a Limits SDK object to a plain dict."""
             if obj is None:
                 return {}
             if isinstance(obj, dict):
@@ -2998,6 +3074,13 @@ def check_recovery_service_limits(
 def fetch_regions_subscribed(
     tenancy_id: Annotated[Optional[str], "OCID of the compartment to scope the search."] = None,
 ) -> dict:
+    """
+    Lists the tenancy's subscribed regions and each region's subscription status.
+
+    ``tenancy_id`` only labels the result; region subscriptions are tenancy-wide,
+    so it does not narrow the lookup. When omitted, the server's own tenancy is
+    used.
+    """
     request_id = uuid.uuid4().hex
     if not tenancy_id:
         tenancy_id = get_tenancy()
@@ -3444,6 +3527,13 @@ def get_recovery_service_metrics(
         "Optional protected database OCID to filter by (maps to resourceId dimension)",
     ] = None,
 ) -> list[dict]:
+    """
+    Queries Monitoring for a Recovery Service metric over a time range.
+
+    Returns one time series per dimension combination, each a list of
+    {timestamp, value} points at the requested resolution and aggregation, and
+    optionally narrowed to a single protected database.
+    """
     # Every interpolated part is validated before it reaches the query string.
     metric_name = _validated_choice(metricName, _METRIC_NAMES, "metricName")
     metric_resolution = _validated_choice(resolution, _METRIC_RESOLUTIONS, "resolution")
@@ -3539,6 +3629,15 @@ def list_databases(
     db_name: Annotated[Optional[str], "Exact database name filter (case-insensitive)."] = None,
     region: Annotated[Optional[str], "Region to execute the request, e.g., us-ashburn-1."] = None,
 ) -> list[DatabaseSummary]:
+    """
+    Lists databases in a DB Home, or across every DB Home in a compartment.
+
+    Exactly one starting point is required: ``db_home_id``, or a
+    ``compartment_id`` whose DB Homes are discovered first. Backup settings are
+    filled in lazily -- the full Database is fetched only when the summary comes
+    back without them -- and each database is correlated with its Recovery
+    Service protection policy where one can be found.
+    """
     try:
         request_id = uuid.uuid4().hex
         client = get_database_client(region, request_id=request_id)
@@ -3751,6 +3850,14 @@ def get_database(
     database_id: Annotated[str, "OCID of the Database to retrieve."],
     region: Annotated[Optional[str], "Canonical OCI region (e.g., us-ashburn-1)."] = None,
 ) -> Database:
+    """
+    Retrieves a Database by OCID and maps it to the server model.
+
+    The mapped result is enriched with ``protection_policy_id`` by correlating
+    the database with Recovery Service protected databases in the same
+    compartment; enrichment failures are swallowed so the core lookup still
+    returns.
+    """
     try:
         request_id = uuid.uuid4().hex
         client = get_database_client(region, request_id=request_id)
@@ -3840,11 +3947,23 @@ def list_restore(
     region: Annotated[Optional[str], "Canonical OCI region (e.g., us-phoenix-1)."] = None,
     aggregate_pages: Annotated[bool, "When true (default), retrieves all pages."] = True,
 ) -> list[WorkRequest]:
+    """
+    Lists restore work requests for a compartment, or for a single resource.
+
+    Work requests are fetched per compartment in scope, filtered down to restore
+    operations, then sorted and optionally narrowed by status. With
+    ``aggregate_pages`` set (the default) every backend page is walked, so
+    ``page`` and ``limit`` only apply when it is turned off.
+    """
     try:
         request_id = uuid.uuid4().hex
         client = get_work_request_client(region, request_id=request_id)
 
         def _is_restore_operation(operation: Optional[str]) -> bool:
+            """
+            Match a work request operation type against "Restore Database", ignoring
+            separator and case differences between SDK versions.
+            """
             if operation is None:
                 return False
             raw = str(operation).strip()
@@ -3950,11 +4069,21 @@ def list_backups(
     region: Annotated[Optional[str], "Canonical OCI region (e.g., us-ashburn-1)."] = None,
     aggregate_pages: Annotated[bool, "When true (default), retrieves all pages."] = True,
 ) -> list[BackupSummary]:
+    """
+    Lists Database backups, either for one database or across a compartment.
+
+    With ``database_id``, backups for that database are listed directly. With
+    ``compartment_id``, AVAILABLE databases that have auto-backup enabled are
+    discovered first and their backups are combined. Manual, automatic and
+    long-term retention backups are all included, and each result is augmented
+    from the raw SDK object for fields the model mapper leaves unset.
+    """
     try:
         request_id = uuid.uuid4().hex
         client = get_database_client(region, request_id=request_id)
 
         def _to_dict(o):
+            """Best-effort conversion of an SDK object to a plain dict."""
             try:
                 if hasattr(oci, "util") and hasattr(oci.util, "to_dict"):
                     d = oci.util.to_dict(o)
@@ -3965,6 +4094,13 @@ def list_backups(
             return getattr(o, "__dict__", {}) if hasattr(o, "__dict__") else {}
 
         def _is_auto_backup_enabled_from_dict(d: dict) -> bool:
+            """
+            Read the auto-backup flag out of a database dict.
+
+            The backup config nests under several different key spellings depending on
+            SDK version and casing, so each known variant is tried before falling back to
+            looking for the flag at the top level.
+            """
             cfg = None
             for k in (
                 "dbBackupConfig",
@@ -3990,6 +4126,7 @@ def list_backups(
             return False
 
         def _list_all_backups_for_db(dbid: str) -> list[dict]:
+            """Walk every backup page for one database and return mapped dicts."""
             out: list[dict] = []
             next_token = None
             while True:
@@ -4030,6 +4167,7 @@ def list_backups(
                         rawd = getattr(obj, "__dict__", {}) or {}
 
                     def _pick(d: dict, *keys: str):
+                        """Return the first non-null value among several key spellings."""
                         for k in keys:
                             if k in d and d[k] is not None:
                                 return d[k]
@@ -4217,6 +4355,7 @@ def get_backup(
             rawd = getattr(resp.data, "__dict__", {}) or {}
 
         def _pick(d: dict, *keys: str):
+            """Return the first non-null value among several key spellings."""
             for k in keys:
                 if k in d and d[k] is not None:
                     return d[k]
@@ -4367,6 +4506,15 @@ def summarize_protected_database_backup_destination(
     max_db_homes: Annotated[Optional[int], "Max number of DB Homes to scan."] = None,
     max_total_databases: Annotated[Optional[int], "Global cap on databases to scan."] = None,
 ) -> ProtectedDatabaseBackupDestinationSummary:
+    """
+    Summarizes how the databases in a compartment or DB Home are backed up.
+
+    Discovers DB Homes when none is given, reads each database's backup
+    configuration, optionally looks up the most recent backup time, and groups
+    the databases by destination type (DBRS, Object Store, NFS) while calling out
+    those with no backup destination configured. Returns one summary object
+    carrying counts, name lists and per-database detail.
+    """
     try:
         request_id = uuid.uuid4().hex
         db_client = get_database_client(region, request_id=request_id)
@@ -4426,6 +4574,7 @@ def summarize_protected_database_backup_destination(
 
         # Helper routines to normalize SDK objects and read fields across variants
         def _to_dict(o: Any) -> dict:
+            """Best-effort conversion of an SDK object to a plain dict."""
             try:
                 if hasattr(oci, "util") and hasattr(oci.util, "to_dict"):
                     d = oci.util.to_dict(o)
@@ -4436,7 +4585,7 @@ def summarize_protected_database_backup_destination(
             return getattr(o, "__dict__", {}) if hasattr(o, "__dict__") else {}
 
         def _get(o: Any, *names: str):
-            # Try attribute names first, then dict conversion
+            """Read the first non-null of several field names, by attribute then by key."""
             for n in names:
                 if hasattr(o, n):
                     v = getattr(o, n)
@@ -4449,7 +4598,12 @@ def summarize_protected_database_backup_destination(
             return None
 
         def _extract_backup_destination_details(db_dict: dict) -> list[dict]:
-            # Discover backup destination details from known key variants
+            """
+            Return a database's backup destination entries as a list.
+
+            The details live under the backup config, whose key spelling varies by SDK
+            version, and may arrive as a single object rather than a list.
+            """
             cfg = None
             for k in (
                 "dbBackupConfig",
@@ -4475,7 +4629,7 @@ def summarize_protected_database_backup_destination(
             return details if isinstance(details, list) else [details]
 
         def _normalize_dest_type(t: Optional[str]) -> str:
-            # Canonicalize destination types to a small set for reporting
+            """Canonicalize a destination type to DBRS, OBJECT_STORE, NFS or UNKNOWN."""
             if not t:
                 return "UNKNOWN"
             u = str(t).upper()
@@ -4493,7 +4647,7 @@ def summarize_protected_database_backup_destination(
             return u
 
         def _is_auto_backup_enabled(db_dict: dict) -> bool:
-            # Determine if auto-backup is enabled from known config keys
+            """Read the auto-backup flag out of a database dict, trying each key variant."""
             cfg = None
             for k in (
                 "dbBackupConfig",
@@ -4527,7 +4681,12 @@ def summarize_protected_database_backup_destination(
             return False
 
         def _read_backup_times_from_obj(o: Any) -> list[Any]:
-            # Collect possible time fields from a backup object (SDK shapes differ)
+            """
+            Collect every timestamp a backup object exposes, newest field first.
+
+            End, start and creation times are all gathered because SDK shapes differ in
+            which of them they populate; the caller picks the most recent.
+            """
             times = []
             for attr in (
                 "time_ended",
@@ -4667,6 +4826,7 @@ def summarize_protected_database_backup_destination(
 
         # Sorting helpers: prioritize DBRS over OBJECT_STORE and then by name
         def _dest_rank(types: list[str]) -> int:
+            """Rank a database's destination types so DBRS sorts ahead of the rest."""
             if not types:
                 return 99
             order = {"DBRS": 0, "OBJECT_STORE": 1, "NFS": 2, "UNKNOWN": 3}
@@ -4682,10 +4842,17 @@ def summarize_protected_database_backup_destination(
 
         # Name list post-processing
         def _uniq_sorted(xs: list[str]) -> list[str]:
+            """Sort names, dropping blanks and duplicates."""
             return sorted(dict.fromkeys([x for x in xs if x]))
 
         # Preserve duplicates for name lists that can correspond to different DB OCIDs
         def _sorted_keep(xs: list[str]) -> list[str]:
+            """
+            Sort names, dropping blanks but keeping duplicates.
+
+            Two databases may share a name under different OCIDs, so collapsing
+            duplicates here would undercount them.
+            """
             return sorted([x for x in xs if x])
 
         db_names_by_type = {k: _sorted_keep(v) for k, v in db_names_by_type.items()}
@@ -4741,7 +4908,12 @@ def list_db_homes(
     page: Annotated[Optional[str], "Pagination token (opc-next-page)."] = None,
     region: Annotated[Optional[str], "Canonical OCI region (e.g., us-ashburn-1)."] = None,
 ) -> list[DatabaseHomeSummary]:
-    # Note: This helper is not exposed as an MCP tool; other tools use it internally.
+    """
+    Lists DB Homes in a compartment, defaulting to the tenancy when none is given.
+
+    Not exposed as an MCP tool; the database and backup tools call it to discover
+    DB Homes before listing what lives in them. Paging is handled internally.
+    """
     try:
         request_id = uuid.uuid4().hex
         client = get_database_client(region, request_id=request_id)
@@ -4804,6 +4976,7 @@ def get_db_home(
     db_home_id: Annotated[str, "OCID of the DB Home to retrieve."],
     region: Annotated[Optional[str], "Canonical OCI region (e.g., us-ashburn-1)."] = None,
 ) -> DatabaseHome:
+    """Retrieves a DB Home by OCID and maps it to the server model."""
     try:
         request_id = uuid.uuid4().hex
         client = get_database_client(region, request_id=request_id)
@@ -4836,6 +5009,12 @@ def list_db_systems(
     page: Annotated[Optional[str], "Pagination token (opc-next-page)."] = None,
     region: Annotated[Optional[str], "Canonical OCI region (e.g., us-ashburn-1)."] = None,
 ) -> list[DbSystemSummary]:
+    """
+    Lists DB Systems in a compartment, defaulting to the tenancy when none is given.
+
+    Paging is handled internally, and the scan can be widened to the full
+    compartment subtree.
+    """
     try:
         request_id = uuid.uuid4().hex
         client = get_database_client(region, request_id=request_id)
@@ -4899,6 +5078,7 @@ def get_db_system(
     db_system_id: Annotated[str, "OCID of the DB System to retrieve."],
     region: Annotated[Optional[str], "Canonical OCI region (e.g., us-ashburn-1)."] = None,
 ) -> DbSystem:
+    """Retrieves a DB System by OCID and maps it to the server model."""
     try:
         request_id = uuid.uuid4().hex
         client = get_database_client(region, request_id=request_id)
@@ -4930,6 +5110,7 @@ def oci_recovery_service_dashboard_prompt() -> str:
 )
 @_tool_logger("onboard_database_to_recovery_service")
 def onboard_database_to_recovery_service() -> str:
+    """Return database onboarding guidance as a tool for clients without prompt support."""
     return ONBOARD_DATABASE_TO_RECOVERY_SERVICE_PROMPT
 
 
@@ -4946,7 +5127,16 @@ def diagnose_recovery_service_issue() -> str:
 
 
 def main():
-    # Entrypoint: choose transport based on env; always log startup meta and log file location
+    """
+    Console entrypoint: start FastMCP over stdio, or over HTTP when a listener is
+    configured.
+
+    ORACLE_MCP_HOST and ORACLE_MCP_PORT must be set together; with neither set the
+    server speaks stdio using local profile credentials. With both set it serves
+    streamable HTTP and authenticates every caller against an OCI IAM (IDCS)
+    domain -- local profile credentials are never used to serve a network
+    listener.
+    """
     global _http_auth
 
     host = (os.getenv("ORACLE_MCP_HOST") or "").strip()

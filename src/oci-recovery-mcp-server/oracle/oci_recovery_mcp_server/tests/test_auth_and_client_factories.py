@@ -33,6 +33,10 @@ class TestProfileClientFactories:
         mock_client,
         _mock_wrap,
     ):
+        """
+        The recovery client is built from the shared auth context's config and signer,
+        with the caller's region overriding the profile's and the user agent stamped on.
+        """
         signer = object()
         mock_auth_context.return_value = SimpleNamespace(
             config={"region": "us-ashburn-1", "tenancy": "ocid1.tenancy.oc1..t"},
@@ -60,6 +64,10 @@ class TestProfileClientFactories:
         mock_client,
         _mock_wrap,
     ):
+        """
+        The monitoring client follows the same path, taking the caller's region and
+        the shared auth context's signer.
+        """
         signer = object()
         mock_auth_context.return_value = SimpleNamespace(
             config={"region": "us-ashburn-1"}, signer=signer
@@ -86,6 +94,13 @@ class TestProfileClientFactories:
         mock_client,
         _mock_wrap,
     ):
+        """
+        Under HTTP each call gets a freshly exchanged signer.
+
+        UPST signers are short-lived and scoped to one caller's token, so caching one
+        would sign a later request as an earlier caller, and keep signing after the
+        token behind it expired.
+        """
         first, second = object(), object()
         mock_http_auth.side_effect = [
             ({"region": "us-phoenix-1"}, first),
@@ -135,9 +150,15 @@ def test_informational_config_reads_same_file_as_the_credentials(monkeypatch, tm
 
 
 def test_profile_auth_context_defers_to_the_shared_library(monkeypatch):
+    """
+    Only the deprecated unseparated "apikey" spelling is translated locally;
+    every other value -- including unset, which means auto-detect -- is passed
+    through untouched so oracle-mcp-common resolves type and profile itself.
+    """
     captured = []
 
     def fake_build_auth_context(*args):
+        """Record the arguments the server hands the shared library."""
         captured.append(args)
         return SimpleNamespace(config={"region": "home"}, signer=object())
 
@@ -162,6 +183,12 @@ def test_profile_auth_context_defers_to_the_shared_library(monkeypatch):
 
 
 def test_client_factories_use_profile_and_http_auth_paths(monkeypatch):
+    """
+    Every client factory names itself correctly to the logging wrapper and honors
+    the caller's region -- except get_identity_client, which passes none so the
+    profile's home region stands. Under stdio the signer comes from the shared
+    auth context; under HTTP, from the per-request token exchange.
+    """
     monkeypatch.setattr(
         server,
         "_wrap_oci_client",
@@ -216,6 +243,11 @@ def test_client_factories_use_profile_and_http_auth_paths(monkeypatch):
 
 
 def test_limits_work_request_and_subscription_client_factories(monkeypatch):
+    """
+    The remaining three factories follow the same contract: the caller's region
+    when given, the resolved home region when not, and the right signer for the
+    transport in use.
+    """
     profile_signer = object()
     monkeypatch.setattr(server, "_serving_http", lambda: False)
     monkeypatch.setattr(

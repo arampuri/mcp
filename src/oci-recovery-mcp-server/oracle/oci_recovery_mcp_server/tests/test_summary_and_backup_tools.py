@@ -18,6 +18,12 @@ import oracle.oci_recovery_mcp_server.server as server
 
 
 def test_summary_tools_fall_back_on_counts_and_metrics(monkeypatch):
+    """
+    Each summary tool reads its field from the list response first and falls back
+    to a per-database GET, counting a database it cannot read as unknown rather
+    than dropping it. Space used skips deleted databases, falls back to the summary
+    metrics when the GET fails, and counts a database with no metrics as missing.
+    """
     recovery_client = MagicMock()
     monkeypatch.setattr(
         server,
@@ -130,6 +136,11 @@ def test_summary_tools_fall_back_on_counts_and_metrics(monkeypatch):
 
 
 def test_summary_serialization_fallbacks_and_error_paths(monkeypatch):
+    """
+    An empty compartment still returns the full declared shape, so a client reads
+    the same fields whether or not anything was found, while a failure from the
+    service itself propagates instead of being reported as zero.
+    """
     recovery_client = MagicMock()
     monkeypatch.setattr(
         server,
@@ -143,8 +154,6 @@ def test_summary_serialization_fallbacks_and_error_paths(monkeypatch):
     )
     recovery_client.list_protected_databases.return_value = _response([])
 
-    # An empty compartment still returns the full declared shape, so a client can
-    # read the same fields whether or not anything was found.
     health = server.summarize_protected_database_health("compartment")
     assert isinstance(health, models.ProtectedDatabaseHealthSummary)
     assert health.aggregated.model_dump(by_alias=True) == {
@@ -174,6 +183,13 @@ def test_summary_serialization_fallbacks_and_error_paths(monkeypatch):
 
 
 def test_backup_tools_handle_manual_paging_errors_and_destination_variants(monkeypatch):
+    """
+    With aggregate_pages off, list_backups forwards the caller's limit and page and
+    stops after one page, and a failed database lookup leaves the enrichment fields
+    empty rather than failing the call. Calling it with neither database_id nor
+    compartment_id is rejected, and get_backup reports the destination type for
+    each variant.
+    """
     db_client = MagicMock()
     monkeypatch.setattr(
         models.oci.util,
@@ -248,6 +264,11 @@ def test_backup_tools_handle_manual_paging_errors_and_destination_variants(monke
 
 
 def test_backup_destination_summary_handles_object_store_paging_and_errors(monkeypatch):
+    """
+    The destination summary walks every database page, counts a database it cannot
+    identify in the total but not in any group, reads the auto-backup flag from
+    both the nested config and the top level, and propagates a listing failure.
+    """
     db_client = MagicMock()
     monkeypatch.setattr(
         models.oci.util,
@@ -318,10 +339,15 @@ def test_backup_destination_summary_handles_object_store_paging_and_errors(monke
 
 
 def test_summary_scans_stop_at_their_deadline_and_say_so(monkeypatch):
-    # One request per protected database across every compartment in scope turns
-    # a single tool call into hundreds of sequential round trips on a large
-    # tenancy, long past the point where an MCP client has stopped waiting.
-    # Stopping and reporting partial counts beats never returning.
+    """
+    A scan that runs out of budget stops, reports only the compartments it
+    finished, and marks itself truncated -- issuing no further per-database GETs.
+
+    One request per protected database across every compartment in scope turns a
+    single tool call into hundreds of sequential round trips on a large tenancy,
+    long past the point where an MCP client has stopped waiting. Stopping and
+    reporting partial counts beats never returning.
+    """
     recovery_client = MagicMock()
     monkeypatch.setattr(
         server, "get_recovery_client", lambda region=None, request_id=None: recovery_client
@@ -346,10 +372,12 @@ def test_summary_scans_stop_at_their_deadline_and_say_so(monkeypatch):
         """Reports its budget as spent before the second item in one page."""
 
         def __init__(self, seconds=None):
+            """Start unexpired, with no checks recorded."""
             self.expired = False
             self._checks = 0
 
         def reached(self):
+            """Report the budget spent from the fourth check onward."""
             self._checks += 1
             # One check enters the first compartment, one enters its page loop,
             # and one admits the first item. The second item must not issue a GET.
@@ -366,6 +394,10 @@ def test_summary_scans_stop_at_their_deadline_and_say_so(monkeypatch):
 
 
 def test_summary_scans_report_every_compartment_when_they_finish(monkeypatch):
+    """
+    A scan that completes within budget reports every compartment it was given and
+    is not marked truncated.
+    """
     recovery_client = MagicMock()
     monkeypatch.setattr(
         server, "get_recovery_client", lambda region=None, request_id=None: recovery_client

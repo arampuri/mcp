@@ -16,6 +16,13 @@ import oracle.oci_recovery_mcp_server.server as server
 
 
 def test_region_subscription_and_limit_tools_return_current_contracts(monkeypatch):
+    """
+    Subscribed regions are read through IAM, normalized across the snake_case and
+    camelCase attribute spellings, sorted, and cached so a second call does not
+    re-query. The limits tool then reports both Recovery Service limits for the
+    resolved region, reading them from an SDK object and a plain dict alike, and
+    passes the caller's opc_request_id through to every call.
+    """
     region_cache = {"fetched_at": 0.0, "ttl_seconds": 3600, "items": {}}
     monkeypatch.setattr(server, "_REGION_CACHE", region_cache)
     monkeypatch.setattr(server, "get_tenancy", lambda: "tenancy")
@@ -107,14 +114,19 @@ def test_region_subscription_and_limit_tools_return_current_contracts(monkeypatc
 
 
 def test_metric_query_parts_are_validated_before_interpolation(monkeypatch):
-    # The MQL query is assembled by string interpolation, so anything the caller
-    # supplies is checked first: without this a caller could reshape the query or
-    # break out of the quoted resourceId filter, and an ordinary typo would come
-    # back as an opaque service-side parse error.
+    """
+    Every caller-supplied part of the MQL query is validated before it is
+    interpolated.
+
+    The query is assembled by string interpolation, so without this a caller could
+    reshape it or break out of the quoted resourceId filter, and an ordinary typo
+    would come back as an opaque service-side parse error.
+    """
     captured = {}
     monitoring_client = MagicMock()
 
     def summarize(compartment_id, summarize_metrics_data_details):
+        """Capture the assembled query instead of calling Monitoring."""
         captured["query"] = summarize_metrics_data_details.query
         captured["resolution"] = summarize_metrics_data_details.resolution
         return _response([])

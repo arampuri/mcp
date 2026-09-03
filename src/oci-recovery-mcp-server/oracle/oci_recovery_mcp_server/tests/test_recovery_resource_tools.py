@@ -18,6 +18,14 @@ import oracle.oci_recovery_mcp_server.server as server
 
 
 def test_recovery_resource_tools_apply_filters_pagination_and_enrichment(monkeypatch):
+    """
+    Each Recovery Service resource tool forwards its filters under the SDK's own
+    names, follows the paging token across responses shaped as a bare list and as
+    an items collection, and enriches results -- protected databases with their
+    metrics and expanded subnets, subnets with their full detail, falling back to
+    the summary's own subnet id when the full lookup fails. Fields the model does
+    not declare are dropped rather than passed through.
+    """
     recovery_client = MagicMock()
     monkeypatch.setattr(
         models.oci.util,
@@ -229,6 +237,12 @@ def test_recovery_resource_tools_apply_filters_pagination_and_enrichment(monkeyp
 
 
 def test_protected_database_tools_fall_back_on_serialization_errors(monkeypatch):
+    """
+    When a mapped model cannot be serialized by any route, the tools fall back to
+    reading its attributes directly: an unmappable item is skipped, a failed subnet
+    or metrics lookup leaves those fields empty, and the metrics block still comes
+    back with every declared key rather than missing.
+    """
     recovery_client = MagicMock()
     monkeypatch.setattr(
         server,
@@ -240,14 +254,19 @@ def test_protected_database_tools_fall_back_on_serialization_errors(monkeypatch)
     )
 
     class FallbackSummary:
+        """A mapped summary that refuses every serialization route."""
+
         def __init__(self):
+            """Expose the attributes the fallback path has to read directly."""
             self.id = "pd-fallback"
             self.recovery_service_subnets = [SimpleNamespace(id="rss-fallback")]
 
         def model_dump(self, **_kwargs):
+            """Fail, forcing the caller past the pydantic route."""
             raise RuntimeError("model dump unavailable")
 
         def dict(self, **_kwargs):
+            """Fail, forcing the caller past the legacy pydantic route."""
             raise RuntimeError("dict unavailable")
 
     monkeypatch.setattr(
@@ -275,14 +294,21 @@ def test_protected_database_tools_fall_back_on_serialization_errors(monkeypatch)
     ]
 
     class BadMetrics:
+        """A metrics object that refuses every serialization route."""
+
         def model_dump(self, **_kwargs):
+            """Fail, forcing the caller past the pydantic route."""
             raise RuntimeError("model dump unavailable")
 
         def dict(self, **_kwargs):
+            """Fail, forcing the caller past the legacy pydantic route."""
             raise RuntimeError("dict unavailable")
 
     class FallbackProtectedDatabase:
+        """A mapped protected database that refuses every serialization route."""
+
         def __init__(self):
+            """Expose the attributes the fallback path has to read directly."""
             self.id = "pd1"
             self.change_rate = 2.0
             self.compression_ratio = 3.0
@@ -290,9 +316,11 @@ def test_protected_database_tools_fall_back_on_serialization_errors(monkeypatch)
             self.metrics = BadMetrics()
 
         def model_dump(self, **_kwargs):
+            """Fail, forcing the caller past the pydantic route."""
             raise RuntimeError("model dump unavailable")
 
         def dict(self, **_kwargs):
+            """Fail, forcing the caller past the legacy pydantic route."""
             raise RuntimeError("dict unavailable")
 
     monkeypatch.setattr(
@@ -323,13 +351,18 @@ def test_protected_database_tools_fall_back_on_serialization_errors(monkeypatch)
     }
 
 
-# The OCI SDK rejects unknown keyword arguments outright, so a parameter a tool
-# advertises but cannot forward is a hard failure at call time, not a silently
-# ignored filter. These stand-ins mirror that behaviour.
 def _strict_client(method_name, allowed, items):
+    """
+    Build a client whose listing method rejects any kwarg outside ``allowed``.
+
+    The OCI SDK rejects unknown keyword arguments outright, so a parameter a tool
+    advertises but cannot forward is a hard failure at call time, not a silently
+    ignored filter. These stand-ins mirror that behaviour.
+    """
     client = MagicMock()
 
     def call(compartment_id=None, **kwargs):
+        """Record the kwargs and return the canned items, refusing anything unexpected."""
         extra = [k for k in kwargs if k not in allowed]
         if extra:
             raise ValueError(f"{method_name} got unknown kwargs: {extra!r}")
@@ -344,8 +377,15 @@ def _strict_client(method_name, allowed, items):
 
 
 def test_list_restore_applies_status_and_sort_without_forwarding_them(monkeypatch):
-    # oci.work_requests.WorkRequestClient.list_work_requests takes only
-    # resource_id, limit, page and opc_request_id.
+    """
+    Status and sort are applied to the results, never forwarded.
+
+    oci.work_requests.WorkRequestClient.list_work_requests accepts only
+    resource_id, limit, page and opc_request_id, so sending it sort_by, sort_order
+    or status would fail the call. Non-restore work requests stay excluded whatever
+    the filters, work requests with no timestamp sort last, and an unknown sort
+    field or order is rejected up front.
+    """
     items = [
         SimpleNamespace(
             id="wr1",
@@ -407,7 +447,10 @@ def test_list_restore_applies_status_and_sort_without_forwarding_them(monkeypatc
 
 
 def test_list_protection_policies_sends_the_id_filter_under_its_sdk_name(monkeypatch):
-    # The SDK call names this filter protection_policy_id and rejects "id".
+    """
+    The tool's ``id`` filter reaches the SDK as ``protection_policy_id``, the name
+    the call actually accepts.
+    """
     client, call = _strict_client(
         "list_protection_policies",
         {

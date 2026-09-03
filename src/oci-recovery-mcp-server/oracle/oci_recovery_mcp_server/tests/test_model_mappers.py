@@ -14,23 +14,35 @@ import oracle.oci_recovery_mcp_server.models as models
 
 
 def test_model_conversion_helpers_handle_fallback_paths(monkeypatch):
+    """
+    The shared conversion helpers degrade rather than raise: a failed
+    ``oci.util.to_dict`` falls back to the object's public attributes, an
+    un-iterable value maps to None, and an object with neither yields None.
+    """
     assert models._oci_to_dict(None) is None
     assert models._first_not_none(None, False, "fallback") is False
     assert models._map_list([1, 2], lambda value: value * 2) == [2, 4]
 
     class BadIterable:
+        """A value that raises the moment anything tries to iterate it."""
+
         def __iter__(self):
+            """Fail every iteration attempt."""
             raise RuntimeError("cannot iterate")
 
     assert models._map_list(BadIterable(), lambda value: value) is None
 
     def raising_to_dict(_sdk_obj):
+        """Stand in for oci.util.to_dict and fail, forcing the fallback path."""
         raise RuntimeError("conversion failed")
 
     monkeypatch.setattr(models.oci.util, "to_dict", raising_to_dict)
 
     class MinimalObject:
+        """An object with one public and one private attribute."""
+
         def __init__(self):
+            """Set the public and private attributes the fallback should distinguish."""
             self.id = "obj1"
             self._private = "hidden"
 
@@ -40,7 +52,14 @@ def test_model_conversion_helpers_handle_fallback_paths(monkeypatch):
 
 
 def test_generated_model_mappers_handle_none_and_sdk_conversion_fallback(monkeypatch):
+    """
+    Every ``map_*`` in the module returns None for None, and survives an empty
+    object with the SDK conversion broken -- swept across the module by
+    reflection so a newly added mapper is covered without editing this test.
+    """
+
     def raising_to_dict(_sdk_obj):
+        """Stand in for oci.util.to_dict and fail, forcing the fallback path."""
         raise RuntimeError("conversion failed")
 
     monkeypatch.setattr(models.oci.util, "to_dict", raising_to_dict)
@@ -55,6 +74,11 @@ def test_generated_model_mappers_handle_none_and_sdk_conversion_fallback(monkeyp
 
 
 def test_model_mappers_capture_nested_and_variant_fields():
+    """
+    Mappers read camelCase input, flatten subnet objects to OCIDs, keep
+    unmodeled destination fields in ``extras``, and populate nested metrics,
+    backup config and work request models.
+    """
     rss = models.map_recovery_service_subnet(
         {
             "id": "rss1",
@@ -111,8 +135,17 @@ def test_model_mappers_capture_nested_and_variant_fields():
 
 
 def test_model_mappers_handle_unusual_iterables_and_attribute_sources(monkeypatch):
+    """
+    A list field that raises on iteration becomes None rather than failing the
+    mapper, a bare OCID string maps as a subnet detail, and a dict-like whose
+    ``get`` never returns anything still yields a model with no ``extras``.
+    """
+
     class BadIterable:
+        """A value that raises the moment anything tries to iterate it."""
+
         def __iter__(self):
+            """Fail every iteration attempt."""
             raise RuntimeError("cannot iterate")
 
     rss = models.map_recovery_service_subnet(
@@ -143,7 +176,10 @@ def test_model_mappers_handle_unusual_iterables_and_attribute_sources(monkeypatc
     )
 
     class GetWithoutItems:
+        """A dict-like that answers every lookup with the default and exposes no items."""
+
         def get(self, _key, default=None):
+            """Return the default for any key."""
             return default
 
     monkeypatch.setattr(models, "_oci_to_dict", lambda _obj: GetWithoutItems())

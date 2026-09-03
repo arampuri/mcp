@@ -18,6 +18,12 @@ import oracle.oci_recovery_mcp_server.server as server
 
 
 def test_database_tools_resolve_compartment_paths_and_enrich_backups(monkeypatch):
+    """
+    The Database-service tools discover DB Homes from a compartment, enrich each
+    result from a follow-up lookup -- backup config and protection policy on
+    databases, unique name and destination type on backups -- and follow the paging
+    token across responses shaped as a bare list and as an items collection.
+    """
     db_client = MagicMock()
     recovery_client = MagicMock()
     monkeypatch.setattr(
@@ -199,6 +205,12 @@ def test_database_tools_resolve_compartment_paths_and_enrich_backups(monkeypatch
 
 
 def test_database_child_scope_tools_deduplicate_results(monkeypatch):
+    """
+    Every subtree-scoped Database-service tool de-duplicates by OCID, so a resource
+    visible from two compartments is returned once. The destination summary is the
+    exception: it still counts each sighting in its total, then de-duplicates the
+    per-database items.
+    """
     db_client = MagicMock()
     recovery_client = MagicMock()
     monkeypatch.setattr(
@@ -380,6 +392,10 @@ def test_database_child_scope_tools_deduplicate_results(monkeypatch):
 
 
 def test_database_home_and_system_tools_apply_pagination_and_defaults(monkeypatch):
+    """
+    The DB Home and DB System tools default to the tenancy when given no
+    compartment, forward their filters, and walk every page.
+    """
     db_client = MagicMock()
     monkeypatch.setattr(
         models.oci.util,
@@ -454,6 +470,13 @@ def test_database_home_and_system_tools_apply_pagination_and_defaults(monkeypatc
 
 
 def test_database_list_branches_and_tool_error_paths(monkeypatch):
+    """
+    list_databases rejects a call with neither starting point, returns empty when a
+    compartment has no DB Homes, and degrades rather than fails when enrichment is
+    unavailable -- leaving the policy or backup config unset. Failures from the
+    services themselves propagate out of every tool, and the guidance tools return
+    their prompt text directly.
+    """
     db_client = MagicMock()
     recovery_client = MagicMock()
     monkeypatch.setattr(
@@ -583,14 +606,19 @@ def test_database_list_branches_and_tool_error_paths(monkeypatch):
 
 
 def test_policy_correlation_survives_an_unreadable_compartment(monkeypatch):
-    # A caller who cannot list protected databases in one compartment of a subtree
-    # gets a 404 there. Discarding the whole correlation would strip the policy
-    # link off every database in every readable compartment too, which reads as
-    # "no protection policy" rather than "could not check".
+    """
+    One compartment the caller cannot read does not strip the policy link from the
+    rest of the subtree.
+
+    Such a caller gets a 404 there. Discarding the whole correlation would strip
+    the policy link off every database in every readable compartment too, which
+    reads as "no protection policy" rather than "could not check".
+    """
     recovery_client = MagicMock()
     database_client = MagicMock()
 
     def list_protected_databases(compartment_id=None, page=None):
+        """Serve one protected database per compartment, refusing the denied one."""
         if compartment_id == "denied":
             raise RuntimeError("NotAuthorizedOrNotFound")
         return _response(

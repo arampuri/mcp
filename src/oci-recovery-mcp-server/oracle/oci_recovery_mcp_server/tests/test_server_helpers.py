@@ -22,6 +22,10 @@ from oracle.oci_recovery_mcp_server.server import mcp
 
 
 def test_deadline_uses_a_monotonic_cooperative_budget(monkeypatch):
+    """
+    _Deadline reports unspent until the monotonic clock passes the budget, then
+    latches expired. A budget of zero disables the deadline entirely.
+    """
     moments = iter([100.0, 100.5, 101.0])
     monkeypatch.setattr(server.time, "monotonic", lambda: next(moments))
 
@@ -34,6 +38,14 @@ def test_deadline_uses_a_monotonic_cooperative_budget(monkeypatch):
 
 
 def test_server_helpers_handle_serialization_config_and_wrapping(monkeypatch, tmp_path):
+    """
+    _safe_jsonable redacts secret-looking keys wherever they appear -- top level,
+    nested, and inside pydantic-style dumps -- truncates long strings, and never
+    raises, degrading to "<unserializable>" for a value whose repr fails.
+    _log_event falls back to plain text when JSON encoding fails, the OCI client
+    wrapper emits start/end and start/error event pairs while re-raising, and only
+    the deprecated unseparated "apikey" spelling is still translated locally.
+    """
     monkeypatch.setattr(server, "_LOG_MAX_VALUE_CHARS", 5)
     monkeypatch.setattr(
         server.oci.util,
@@ -42,21 +54,30 @@ def test_server_helpers_handle_serialization_config_and_wrapping(monkeypatch, tm
     )
 
     class DumpOnly:
+        """A pydantic-style object exposing only ``model_dump``."""
+
         __slots__ = ()
 
         def model_dump(self, **_kwargs):
+            """Return a payload holding one secret-looking key and one long value."""
             return {"token": "secret", "value": "abcdef"}
 
     class DictOnly:
+        """An older pydantic-style object exposing only ``dict``."""
+
         __slots__ = ()
 
         def dict(self, **_kwargs):
+            """Return a payload holding one secret-looking key."""
             return {"private_key": "secret", "value": "ok"}
 
     class BadRepr:
+        """An object that cannot even be repr'd -- the last fallback _safe_jsonable has."""
+
         __slots__ = ()
 
         def __repr__(self):
+            """Fail, leaving _safe_jsonable no way to render this object."""
             raise RuntimeError("bad repr")
 
     safe = server._safe_jsonable(
@@ -152,6 +173,12 @@ def test_server_helpers_handle_serialization_config_and_wrapping(monkeypatch, tm
 
 
 def test_logging_tool_wrapper_tenancy_and_apikey_client_paths(monkeypatch, tmp_path):
+    """
+    setup_logging is idempotent and installs both handlers when the console is
+    requested, the tool decorator logs a start/error pair and re-raises, and
+    get_tenancy prefers the env override, then the profile under stdio -- while
+    under HTTP it uses the configured tenancy and never touches the OCI config.
+    """
     root_logger = server.logging.getLogger()
     original_handlers = list(root_logger.handlers)
     try:
@@ -181,6 +208,7 @@ def test_logging_tool_wrapper_tenancy_and_apikey_client_paths(monkeypatch, tmp_p
 
     @server._tool_logger("boom")
     def failing_tool():
+        """A decorated tool that always raises, to exercise the error phase."""
         raise ValueError("bad input")
 
     with pytest.raises(ValueError, match="bad input"):
@@ -211,10 +239,14 @@ def test_logging_tool_wrapper_tenancy_and_apikey_client_paths(monkeypatch, tmp_p
 
 
 def test_logging_falls_back_to_stderr_when_the_log_file_cannot_be_opened(monkeypatch, tmp_path):
-    # A read-only filesystem, a directory owned by another user, or a full disk
-    # must not stop the server from starting: setup_logging() runs at import, so
-    # an unhandled OSError here takes the process down before main() can report
-    # anything at all.
+    """
+    An unopenable log file leaves the server running and logging to stderr.
+
+    A read-only filesystem, a directory owned by another user, or a full disk must
+    not stop the server from starting: setup_logging() runs at import, so an
+    unhandled OSError here would take the process down before main() could report
+    anything at all.
+    """
     unwritable = tmp_path / "no-write"
     unwritable.mkdir(mode=0o500)
     monkeypatch.setenv("ORACLE_MCP_LOG_DIR", str(unwritable / "logs"))
@@ -240,9 +272,13 @@ def test_logging_falls_back_to_stderr_when_the_log_file_cannot_be_opened(monkeyp
 
 
 def test_log_files_are_private_to_their_owner(monkeypatch, tmp_path):
-    # Tool arguments, and tool results at DEBUG, put a tenancy's resource
-    # inventory in this file; on a shared host the default mode would let every
-    # local user read it.
+    """
+    Each rotation opens the log file with mode 0600.
+
+    Tool arguments, and tool results at DEBUG, put a tenancy's resource inventory
+    in this file; on a shared host the default mode would let every local user
+    read it.
+    """
     log_file = tmp_path / "logs" / "server.log"
     log_file.parent.mkdir()
     handler = server._PrivateRotatingFileHandler(str(log_file), encoding="utf-8")
@@ -254,9 +290,13 @@ def test_log_files_are_private_to_their_owner(monkeypatch, tmp_path):
 
 
 def test_state_directory_is_outside_the_install_tree(monkeypatch, tmp_path):
-    # The package directory is read-only on a hardened deployment and is thrown
-    # away entirely between `uvx` runs, which would silently discard the logs an
-    # operator is told to read.
+    """
+    State lands under the home directory by default, and follows the env override.
+
+    The package directory is read-only on a hardened deployment and is thrown away
+    entirely between ``uvx`` runs, which would silently discard the logs an
+    operator is told to read.
+    """
     monkeypatch.delenv(server._STATE_DIR_ENV, raising=False)
     monkeypatch.setattr(server.Path, "home", classmethod(lambda cls: tmp_path))
     assert server._state_dir() == tmp_path / server._STATE_DIR_NAME
@@ -267,6 +307,10 @@ def test_state_directory_is_outside_the_install_tree(monkeypatch, tmp_path):
 
 
 def test_results_are_summarized_at_info_and_written_only_at_debug(monkeypatch):
+    """
+    A tool result is logged as its shape at INFO and in full only at DEBUG, so an
+    ordinary run does not write a tenancy's resource inventory to disk.
+    """
     events = []
     monkeypatch.setattr(
         server, "_log_event", lambda event, **kwargs: events.append((event, kwargs))
@@ -274,6 +318,7 @@ def test_results_are_summarized_at_info_and_written_only_at_debug(monkeypatch):
 
     @server._tool_logger("demo")
     def demo():
+        """A decorated tool returning a result that names a real-looking OCID."""
         return [{"id": "ocid1.protecteddatabase.oc1..secret"}]
 
     monkeypatch.setattr(server, "_log_full_payloads", lambda: False)
@@ -289,8 +334,13 @@ def test_results_are_summarized_at_info_and_written_only_at_debug(monkeypatch):
 
 
 def test_caches_evict_expired_entries_and_stay_bounded():
-    # Both caches are partitioned per tenant and per caller, so a hosted
-    # deployment gains an entry for every person who signs in.
+    """
+    The caches drop expired entries, cap at _CACHE_MAX_ENTRIES, and evict
+    least-recently-used first -- a hit moves an entry back to the front.
+
+    Both caches are partitioned per tenant and per caller, so a hosted deployment
+    gains an entry for every person who signs in.
+    """
     entries: dict = {}
     now = 1000.0
     for index in range(server._CACHE_MAX_ENTRIES + 5):
@@ -309,8 +359,13 @@ def test_caches_evict_expired_entries_and_stay_bounded():
 
 
 def test_http_deployments_refuse_to_fall_back_to_profile_credentials(monkeypatch):
-    # Signing a remote caller's request with the operator's own credentials would
-    # perform it under a different, probably broader, identity.
+    """
+    Once an HTTP auth policy exists, _config_and_signer raises rather than reach
+    for the local profile; with none built, stdio resolves through it as usual.
+
+    Signing a remote caller's request with the operator's own credentials would
+    perform it under a different, probably broader, identity.
+    """
     monkeypatch.setattr(server, "_serving_http", lambda: False)
     monkeypatch.setattr(server, "_http_auth", object())
     monkeypatch.setattr(

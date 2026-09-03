@@ -18,6 +18,14 @@ import oracle.oci_recovery_mcp_server.server as server
 
 
 def test_compartment_and_database_home_helpers_resolve_ids(monkeypatch):
+    """
+    Compartment listing walks every page and appends the root tenancy, name lookup
+    is case-insensitive, and _resolve_compartment_id passes OCIDs through while
+    resolving names -- raising a distinct error for missing, blank, unknown and
+    unresolvable input. DB Home discovery reads ids from both object and dict
+    items, skips entries without one, and returns empty rather than raising when
+    the Database service is unavailable.
+    """
     compartments = [
         SimpleNamespace(id="compartment-a", name="Dev"),
         SimpleNamespace(id="compartment-b", name="Prod"),
@@ -94,6 +102,14 @@ def test_compartment_and_database_home_helpers_resolve_ids(monkeypatch):
 
 
 def test_child_compartment_helpers_use_cache_fast_path_and_fallback(monkeypatch):
+    """
+    The compartment list is de-duplicated, has the root appended, and is cached by
+    identity so a second call reuses it. The children index skips compartments
+    with no parent, subtree expansion returns the root alone when children are not
+    requested, and falls back to crawling Identity page by page when the cache is
+    empty. If expansion fails outright, the tool still scopes to the one resolved
+    compartment rather than failing the call.
+    """
     monkeypatch.setattr(
         server,
         "_COMPARTMENT_CACHE",
@@ -174,6 +190,10 @@ def test_child_compartment_helpers_use_cache_fast_path_and_fallback(monkeypatch)
 
 
 def test_fetch_child_compartments_crawls_and_applies_output_options(monkeypatch):
+    """
+    fetch_child_compartments reports the resolved root, honors include_self, and
+    truncates to the requested limit.
+    """
     identity_client = MagicMock()
     identity_client.list_compartments.side_effect = [
         _response([SimpleNamespace(id="child")]),
@@ -210,6 +230,12 @@ def test_fetch_child_compartments_crawls_and_applies_output_options(monkeypatch)
 
 
 def test_child_scope_tools_deduplicate_and_forward_filter_kwargs(monkeypatch):
+    """
+    Every subtree-scoped tool de-duplicates resources seen in more than one
+    compartment, keeps the summary when an optional full lookup fails, tags metric
+    series with the compartment they came from, and forwards only kwargs the SDK
+    actually accepts.
+    """
     recovery_client = MagicMock()
     monitoring_client = MagicMock()
     work_request_client = MagicMock()
@@ -315,9 +341,16 @@ def test_child_scope_tools_deduplicate_and_forward_filter_kwargs(monkeypatch):
     _WORK_REQUEST_KWARGS = {"compartment_id", "resource_id", "limit", "page", "opc_request_id"}
 
     def _strict_work_requests(pages):
+        """
+        Build a list_work_requests stub that rejects unknown kwargs.
+
+        The real client raises on kwargs it does not accept; a permissive mock is what
+        let a tool ship advertising parameters the SDK call rejects.
+        """
         responses = iter(pages)
 
         def call(**kwargs):
+            """Return the next canned page, first refusing any unexpected kwarg."""
             extra = sorted(k for k in kwargs if k not in _WORK_REQUEST_KWARGS)
             if extra:
                 raise ValueError(f"list_work_requests got unknown kwargs: {extra!r}")
