@@ -2,6 +2,12 @@
 
 All notable changes to `oracle-mcp-common` are documented in this file.
 
+## 0.1.5
+
+### Changed
+
+- Require FastMCP 3.4.5 or newer for IDCS HTTP auth scope configuration.
+
 ## 0.1.4
 
 ### Added
